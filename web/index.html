@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ayla 个人 Agent 工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">A</div>
+          <div>
+            <strong>Ayla</strong>
+            <span>个人 Agent 工作台</span>
+          </div>
+        </div>
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-view="dashboard" type="button">
+            <span class="nav-icon">⌂</span>
+            <span>今日</span>
+          </button>
+          <button class="nav-item" data-view="inbox" type="button">
+            <span class="nav-icon">▣</span>
+            <span>收件箱</span>
+          </button>
+          <button class="nav-item" data-view="tasks" type="button">
+            <span class="nav-icon">✓</span>
+            <span>TODO</span>
+          </button>
+          <button class="nav-item" data-view="memos" type="button">
+            <span class="nav-icon">✎</span>
+            <span>备忘</span>
+          </button>
+          <button class="nav-item" data-view="knowledge" type="button">
+            <span class="nav-icon">◇</span>
+            <span>知识库</span>
+          </button>
+          <button class="nav-item" data-view="graph" type="button">
+            <span class="nav-icon">◎</span>
+            <span>图谱</span>
+          </button>
+          <button class="nav-item" data-view="settings" type="button">
+            <span class="nav-icon">⚙</span>
+            <span>设置</span>
+          </button>
+        </nav>
+        <div class="sidebar-footer">
+          <span id="workspace-status">未连接</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Local first workspace</p>
+            <h1 id="view-title">今日看板</h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="notify-button" data-action="toggle-notifications" type="button">提醒关闭</button>
+            <button class="icon-button" data-action="refresh" type="button" aria-label="刷新">↻</button>
+          </div>
+        </header>
+        <section id="view-root" class="view-root" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

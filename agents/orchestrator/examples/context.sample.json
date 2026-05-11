@@ -1,0 +1,37 @@
+{
+  "workspace": "Ayla personal agent workspace",
+  "today": "2026-05-11",
+  "entrypoints": ["feishu_bot", "local_web", "browser_share", "file_drop"],
+  "categories": ["工作", "学习", "项目", "会议", "实验", "个人", "待整理", "可公开", "报告"],
+  "storage_targets": ["local_state", "feishu_doc", "obsidian_public_vault"],
+  "visibility": ["private", "internal", "public"],
+  "public_vault_sections": ["00_Inbox", "10_Concepts", "20_Resources", "30_Methods", "40_Tools", "50_ReadLater", "90_Archive"],
+  "local_state_sections": ["work_records", "meeting_actions", "experiment_snapshots", "reports", "audit_log", "inbox", "tasks"],
+  "projects": ["Ayla", "Libra", "OpenClaw"],
+  "tags": ["topic/pkm", "topic/libra", "source/feishu", "type/todo"],
+  "pinned_slots": [
+    {
+      "title": "工作信息",
+      "category": "工作"
+    },
+    {
+      "title": "待读书清单",
+      "category": "学习"
+    }
+  ],
+  "permission_policies": {
+    "auto_read": "本地读和外部只读查询可自动执行，只记录范围摘要。",
+    "auto_draft": "AI 解析、摘要和标签建议只生成候选，不直接写长期状态。",
+    "batch_confirm": "低风险本地写入进入日维度批量确认。",
+    "instant_confirm": "TODO、提醒、飞书文档写入和外部动作必须即时确认。",
+    "double_confirm": "删除、覆盖、批量外发和公开发布必须二次确认。",
+    "forbidden": "凭证、Cookie、密钥和私密正文入日志禁止自动执行。"
+  },
+  "rules": [
+    "飞书 Bot 是主入口；本地 Web 是展示、编辑和确认层。",
+    "所有输入先落 SourceEvent 和 InboxItem，再生成候选结果。",
+    "公开知识只在 visibility=public 且 storage_target=obsidian_public_vault 时写入 PublicKnowledgeVault。",
+    "工作沉淀、会议纪要、实验状态和 TODO 默认留在 LocalWorkState 或飞书文档引用。",
+    "低风险本地写入日维度批量确认；外部写操作、DDL、删除和公开发布必须即时或二次确认。"
+  ]
+}

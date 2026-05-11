@@ -8,58 +8,62 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">A</div>
-          <div>
-            <strong>Ayla</strong>
-            <span>个人 Agent 工作台</span>
-          </div>
+      <aside class="sidebar glass-panel">
+        <div class="sidebar-top">
+            <div class="brand">
+              <div class="brand-mark">A</div>
+              <div class="brand-copy">
+                <strong>Ayla OS</strong>
+                <span id="brand-account">个人工作台</span>
+              </div>
+            </div>
+          <button class="icon-button collapse-button" data-action="toggle-sidebar" type="button" aria-label="切换侧边栏">☰</button>
         </div>
-        <nav class="nav" aria-label="主导航">
+        <nav class="nav sidebar-nav" aria-label="主导航">
           <button class="nav-item active" data-view="dashboard" type="button">
             <span class="nav-icon">⌂</span>
-            <span>今日</span>
+            <span class="nav-label"><strong>今日看板</strong><small>日程 / TODO / 总结</small></span>
           </button>
-          <button class="nav-item" data-view="inbox" type="button">
-            <span class="nav-icon">▣</span>
-            <span>收件箱</span>
-          </button>
-          <button class="nav-item" data-view="tasks" type="button">
-            <span class="nav-icon">✓</span>
-            <span>TODO</span>
+          <button class="nav-item" data-view="okr" type="button">
+            <span class="nav-icon">◎</span>
+            <span class="nav-label"><strong>OKR 看板</strong><small>季度目标 / Roadmap</small></span>
           </button>
           <button class="nav-item" data-view="memos" type="button">
             <span class="nav-icon">✎</span>
-            <span>备忘</span>
+            <span class="nav-label"><strong>备忘看板</strong><small>命令 / 文档 / 实验</small></span>
           </button>
           <button class="nav-item" data-view="knowledge" type="button">
-            <span class="nav-icon">◇</span>
-            <span>知识库</span>
-          </button>
-          <button class="nav-item" data-view="graph" type="button">
-            <span class="nav-icon">◎</span>
-            <span>图谱</span>
+            <span class="nav-icon">◫</span>
+            <span class="nav-label"><strong>资产看板</strong><small>个人知识 / 工作索引</small></span>
           </button>
           <button class="nav-item" data-view="settings" type="button">
             <span class="nav-icon">⚙</span>
-            <span>设置</span>
+            <span class="nav-label"><strong>个人设置</strong><small>模型 / 飞书 / 同步</small></span>
           </button>
         </nav>
         <div class="sidebar-footer">
-          <span id="workspace-status">未连接</span>
+          <h3>本地优先</h3>
+          <p id="workspace-status">未连接</p>
         </div>
       </aside>
 
       <main class="workspace">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Local first workspace</p>
+        <header class="topbar glass-panel">
+          <div class="breadcrumb">
+            <p class="eyebrow">Personal Workbench</p>
             <h1 id="view-title">今日看板</h1>
           </div>
           <div class="topbar-actions">
+            <div class="status-chip">当前焦点：本地 Agent 闭环</div>
+            <button class="icon-button theme-button" data-action="toggle-theme" type="button" aria-label="切换主题">
+              <span id="theme-icon">◐</span>
+            </button>
             <button class="notify-button" data-action="toggle-notifications" type="button">提醒关闭</button>
             <button class="icon-button" data-action="refresh" type="button" aria-label="刷新">↻</button>
+            <div class="user-block">
+              <div class="avatar" id="user-avatar">AY</div>
+              <div class="user-meta"><strong id="user-name">本地用户</strong><span id="user-handle">@ayla.local</span></div>
+            </div>
           </div>
         </header>
         <section id="view-root" class="view-root" aria-live="polite"></section>

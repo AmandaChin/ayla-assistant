@@ -1,0 +1,43 @@
+{
+  "source": "example_manual",
+  "author": "ayla-orchestrator",
+  "raw_input": "https://example.com/pkm 这篇个人知识管理文章不错，先放待读；另外明天下午 3 点提醒我看 Libra 实验数据。",
+  "intent": "capture",
+  "summary": "输入包含一条公开待读资料和一个内部实验跟进 TODO。",
+  "candidates": [
+    {
+      "type": "public_note",
+      "title": "个人知识管理文章待读",
+      "content": "用户收藏了一篇关于个人知识管理的文章，适合进入公开知识库的待读资料区。",
+      "storage_target": "obsidian_public_vault",
+      "visibility": "public",
+      "tags": ["topic/pkm", "type/resource", "status/readlater"],
+      "source_refs": ["https://example.com/pkm"],
+      "risk_level": "low",
+      "requires_confirmation": true,
+      "confidence": 0.86,
+      "due_at": "",
+      "priority": "normal",
+      "project": "",
+      "source_url": "https://example.com/pkm"
+    },
+    {
+      "type": "todo",
+      "title": "看 Libra 实验数据",
+      "content": "明天下午 3 点查看 Libra 实验数据，并判断是否需要继续跟进。",
+      "storage_target": "local_state",
+      "visibility": "internal",
+      "tags": ["source/manual", "topic/libra", "type/todo"],
+      "source_refs": ["agent_input"],
+      "risk_level": "low",
+      "requires_confirmation": true,
+      "confidence": 0.9,
+      "due_at": "2026-05-12 15:00",
+      "priority": "medium",
+      "project": "Libra",
+      "source_url": ""
+    }
+  ],
+  "questions": [],
+  "tool_actions": []
+}

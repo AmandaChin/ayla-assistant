@@ -5,6 +5,7 @@ import argparse
 import html
 import json
 import mimetypes
+import os
 import re
 import shlex
 import shutil
@@ -24,13 +25,52 @@ from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
-VAULT_ROOT = ROOT / "agent-vault"
+
+
+def default_project_root() -> Path:
+    documents_project = Path.home() / "Documents" / "ayla assistant"
+    if ".codex/worktrees" in str(ROOT) and documents_project.exists():
+        return documents_project
+    return ROOT
+
+
+def configured_root(env_key: str, fallback: Path) -> Path:
+    value = Path(os.environ.get(env_key, str(fallback))).expanduser()
+    if not value.is_absolute():
+        value = ROOT / value
+    return value
+
+
+PROJECT_ROOT = configured_root("AYLA_PROJECT_ROOT", default_project_root())
+VAULT_ROOT = configured_root("AYLA_VAULT_ROOT", PROJECT_ROOT / "agent-vault")
 LOCAL_STATE_ROOT = VAULT_ROOT / "LocalWorkState"
 PUBLIC_VAULT_ROOT = VAULT_ROOT / "PublicKnowledgeVault"
 RUNTIME_ROOT = VAULT_ROOT / "runtime"
 DB_PATH = VAULT_ROOT / "system" / "database.sqlite"
 
+
+def normalize_user_path(value: object, fallback: Path, base: Path = PROJECT_ROOT) -> Path:
+    raw = str(value or "").strip()
+    path = Path(raw).expanduser() if raw else fallback
+    if not path.is_absolute():
+        path = base / path
+    return path
+
+
+def asset_path_settings(asset_root_value: object) -> dict:
+    asset_root = normalize_user_path(asset_root_value, VAULT_ROOT)
+    state_root = asset_root / "LocalWorkState"
+    public_root = asset_root / "PublicKnowledgeVault"
+    return {
+        "asset_root_path": str(asset_root),
+        "state_root_path": str(state_root),
+        "vault_path": str(public_root),
+        "public_vault_path": str(public_root),
+        "work_library_path": str(state_root / "work_records"),
+    }
+
 DEFAULT_SETTINGS = {
+    "asset_root_path": str(VAULT_ROOT),
     "state_root_path": str(LOCAL_STATE_ROOT),
     "vault_path": str(PUBLIC_VAULT_ROOT),
     "public_vault_path": str(PUBLIC_VAULT_ROOT),
@@ -165,6 +205,11 @@ STUDY_WORDS = ["学习", "资料", "课程", "论文", "方法论", "总结", "�
 WORK_WORDS = ["飞书", "会议", "需求", "项目", "接口", "上线", "排期", "评审"]
 PERSONAL_WORDS = ["个人", "生活", "提醒", "买", "预约"]
 URL_RE = re.compile(r"https?://[^\s<>\"'）)]+", re.I)
+LARK_DOC_HOSTS = ("larkoffice.com", "feishu.cn", "larksuite.com")
+LARK_DOC_PATH_RE = re.compile(r"/(?:docx|docs|wiki)/", re.I)
+FETCH_READ_LIMIT = 4 * 1024 * 1024
+FULL_MARKDOWN_LIMIT = 180_000
+SUMMARY_TEXT_LIMIT = 2200
 
 DEFAULT_PINNED_SLOTS = [
     ("工作信息", "工作", "固定记录工作职责、常用项目、协作人、常用链接或环境信息。"),
@@ -717,9 +762,151 @@ def compact_text(text: str, limit: int = 420) -> str:
     return text[:limit].rstrip() + "..."
 
 
+def trim_markdown(text: str, limit: int = FULL_MARKDOWN_LIMIT) -> str:
+    cleaned = html.unescape(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "\n\n> 内容较长，已截取前段正文。"
+
+
+def inline_html_to_markdown(raw: str) -> str:
+    text = raw or ""
+
+    def image_repl(match: re.Match) -> str:
+        attrs = match.group(1) or ""
+        src_match = re.search(r"\bsrc=[\"']([^\"']+)[\"']", attrs, flags=re.I)
+        if not src_match:
+            return ""
+        alt_match = re.search(r"\balt=[\"']([^\"']*)[\"']", attrs, flags=re.I)
+        alt = compact_text(alt_match.group(1), 80) if alt_match else "image"
+        return f"![{alt}]({html.unescape(src_match.group(1))})"
+
+    def link_repl(match: re.Match) -> str:
+        href = html.unescape(match.group(1) or "").strip()
+        label = inline_html_to_markdown(match.group(2) or "").strip()
+        if label.startswith("[") and label.endswith("]"):
+            label = label[1:-1].strip()
+        if not label:
+            label = href
+        if not href:
+            return label
+        return f"[{label}]({href})"
+
+    text = re.sub(r"(?is)<img\b([^>]*)>", image_repl, text)
+    text = re.sub(r"(?is)<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", link_repl, text)
+    text = re.sub(r"(?is)</?(b|strong)\b[^>]*>", "**", text)
+    text = re.sub(r"(?is)</?(i|em)\b[^>]*>", "*", text)
+    text = re.sub(r"(?is)<br\s*/?>", " ", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def remaining_html_to_markdown(raw: str) -> str:
+    text = raw or ""
+
+    def link_repl(match: re.Match) -> str:
+        href = html.unescape(match.group(1) or "").strip()
+        label = inline_html_to_markdown(match.group(2) or "").strip()
+        if label.startswith("[") and label.endswith("]"):
+            label = label[1:-1].strip()
+        if not label:
+            label = href
+        return f"[{label}]({href})" if href else label
+
+    text = re.sub(
+        r"(?is)<img\b([^>]*)>",
+        lambda match: inline_html_to_markdown(match.group(0)),
+        text,
+    )
+    text = re.sub(
+        r"(?is)<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        link_repl,
+        text,
+    )
+    text = re.sub(r"(?is)</?(b|strong)\b[^>]*>", "**", text)
+    text = re.sub(r"(?is)</?(i|em)\b[^>]*>", "*", text)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
+def html_to_markdown(raw_html: str, limit: int = FULL_MARKDOWN_LIMIT) -> str:
+    text = raw_html or ""
+    text = re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", "\n\n", text)
+    text = re.sub(
+        r"(?is)<title[^>]*>(.*?)</title>",
+        lambda match: f"\n\n# {inline_html_to_markdown(match.group(1))}\n\n",
+        text,
+    )
+
+    def whiteboard_repl(match: re.Match) -> str:
+        attrs = match.group(1) or ""
+        body = html.unescape(match.group(2) or "").strip()
+        if "mermaid" in attrs.lower() and body:
+            return f"\n\n```mermaid\n{body}\n```\n\n"
+        token_match = re.search(r"\btoken=[\"']([^\"']+)[\"']", attrs, flags=re.I)
+        token = token_match.group(1) if token_match else ""
+        return f"\n\n> 图示/白板：{token}\n\n" if token else "\n\n"
+
+    def pre_repl(match: re.Match) -> str:
+        body = re.sub(r"(?is)<[^>]+>", "", match.group(1) or "")
+        body = html.unescape(body).strip("\n")
+        return f"\n\n```\n{body}\n```\n\n" if body else "\n\n"
+
+    def heading_repl(match: re.Match) -> str:
+        level = int(match.group(1))
+        title = inline_html_to_markdown(match.group(2) or "")
+        return f"\n\n{'#' * min(level, 6)} {title}\n\n" if title else "\n\n"
+
+    def list_repl(match: re.Match) -> str:
+        item = inline_html_to_markdown(match.group(1) or "")
+        return f"\n- {item}\n" if item else "\n"
+
+    def paragraph_repl(match: re.Match) -> str:
+        body = inline_html_to_markdown(match.group(1) or "")
+        return f"\n\n{body}\n\n" if body else "\n\n"
+
+    def table_cell_repl(match: re.Match) -> str:
+        body = inline_html_to_markdown(match.group(1) or "")
+        return f" {body} |" if body else " |"
+
+    text = re.sub(r"(?is)<whiteboard\b([^>]*)>(.*?)</whiteboard>", whiteboard_repl, text)
+    text = re.sub(r"(?is)<pre\b[^>]*>(.*?)</pre>", pre_repl, text)
+    text = re.sub(r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1>", heading_repl, text)
+    text = re.sub(r"(?is)<li\b[^>]*>(.*?)</li>", list_repl, text)
+    text = re.sub(r"(?is)<p\b[^>]*>(.*?)</p>", paragraph_repl, text)
+    text = re.sub(r"(?is)<callout\b[^>]*>(.*?)</callout>", paragraph_repl, text)
+    text = re.sub(r"(?is)<(blockquote|section|article|div)\b[^>]*>(.*?)</\1>", paragraph_repl, text)
+    text = re.sub(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", table_cell_repl, text)
+    text = re.sub(r"(?is)</tr>", "\n", text)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = remaining_html_to_markdown(text)
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    return trim_markdown(text, limit)
+
+
+def markdown_to_summary_text(markdown: str, limit: int = SUMMARY_TEXT_LIMIT) -> str:
+    text = re.sub(r"```[\s\S]*?```", " ", markdown or "")
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"^\s*[-*]\s+", "", text, flags=re.M)
+    return compact_text(text, limit)
+
+
+def html_to_readable_text(raw_html: str, limit: int = SUMMARY_TEXT_LIMIT) -> str:
+    return markdown_to_summary_text(html_to_markdown(raw_html), limit)
+
+
 def parse_html_metadata(raw_html: str, url: str) -> dict:
     title_match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.I | re.S)
-    title = compact_text(title_match.group(1), 96) if title_match else ""
+    title = compact_text(inline_html_to_markdown(title_match.group(1)), 96) if title_match else ""
     desc_match = re.search(
         r"<meta[^>]+(?:name|property)=[\"'](?:description|og:description)[\"'][^>]+content=[\"'](.*?)[\"'][^>]*>",
         raw_html,
@@ -732,17 +919,58 @@ def parse_html_metadata(raw_html: str, url: str) -> dict:
             flags=re.I | re.S,
         )
     description = compact_text(desc_match.group(1), 260) if desc_match else ""
-    body = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", raw_html)
-    body = re.sub(r"(?is)<br\s*/?>", "\n", body)
-    body = re.sub(r"(?is)</p|</div|</li|</h[1-6]", "\n<", body)
-    body = re.sub(r"(?is)<[^>]+>", " ", body)
-    body = compact_text(body, 900)
+    content_markdown = html_to_markdown(raw_html)
+    body = markdown_to_summary_text(content_markdown)
     return {
         "url": url,
         "title": title or url,
         "description": description,
         "excerpt": body,
+        "content_markdown": content_markdown,
+        "content_length": len(content_markdown),
     }
+
+
+def is_lark_doc_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    return any(host.endswith(domain) for domain in LARK_DOC_HOSTS) and bool(LARK_DOC_PATH_RE.search(parsed.path))
+
+
+def first_link_summary_sentence(text: str) -> str:
+    for sentence in link_summary_sentences(text, max_points=1):
+        return sentence
+    return compact_text(text, 160)
+
+
+def fetch_lark_doc_metadata(settings: dict, url: str) -> dict:
+    payload = run_lark_cli_json(
+        settings,
+        ["docs", "+fetch", "--api-version", "v2", "--as", "user", "--doc", url, "--format", "json"],
+        timeout=45,
+    )
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    document = data.get("document") if isinstance(data.get("document"), dict) else data
+    raw_content = str(document.get("content") or document.get("text") or document.get("body") or "")
+    parsed = (
+        parse_html_metadata(raw_content, url)
+        if raw_content
+        else {"url": url, "title": url, "description": "", "excerpt": "", "content_markdown": "", "content_length": 0}
+    )
+    explicit_title = str(document.get("title") or document.get("name") or "").strip()
+    if explicit_title:
+        parsed["title"] = compact_text(explicit_title, 96)
+    if not parsed.get("description") and parsed.get("excerpt"):
+        parsed["description"] = first_link_summary_sentence(parsed["excerpt"])
+    parsed.update(
+        {
+            "provider": "lark-cli-docs",
+            "provider_label": "飞书文档",
+            "document_id": str(document.get("document_id") or document.get("token") or ""),
+            "revision_id": str(document.get("revision_id") or ""),
+        }
+    )
+    return parsed
 
 
 def fetch_url_metadata(url: str) -> dict:
@@ -754,68 +982,149 @@ def fetch_url_metadata(url: str) -> dict:
         },
     )
     with urlrequest.urlopen(req, timeout=8) as response:
-        raw = response.read(1024 * 1024)
+        raw = response.read(FETCH_READ_LIMIT)
         charset = read_charset(response.headers)
         text = raw.decode(charset, errors="replace")
         content_type = response.headers.get("content-type", "")
     if "html" in content_type.lower() or "<html" in text[:500].lower():
-        return parse_html_metadata(text, url)
+        parsed = parse_html_metadata(text, url)
+        parsed.update({"provider": "http-html", "provider_label": "网页"})
+        return parsed
     return {
         "url": url,
         "title": url,
         "description": "",
-        "excerpt": compact_text(text, 900),
+        "excerpt": compact_text(text, SUMMARY_TEXT_LIMIT),
+        "content_markdown": trim_markdown(text),
+        "content_length": len(text),
+        "provider": "http-text",
+        "provider_label": "网页",
     }
 
 
+def link_summary_sentences(text: str, max_points: int = 3) -> list[str]:
+    raw = re.split(r"(?<=[。！？!?])\s*|[\n\r]+", text)
+    points = []
+    seen = set()
+    for item in raw:
+        sentence = compact_text(item.strip(" -•\t"), 120)
+        if len(sentence) < 14 or sentence in seen:
+            continue
+        if sentence.startswith(("来源", "链接", "http")):
+            continue
+        points.append(sentence)
+        seen.add(sentence)
+        if len(points) >= max_points:
+            break
+    return points
+
+
+def clean_link_request_note(text: str) -> str:
+    note = strip_urls(text)
+    note = re.sub(r"[，。,.!！?？；;、]+", " ", note)
+    low_signal_patterns = [
+        r"(帮我|麻烦|请|给我)?\s*(总结|整理|归纳|提炼|概括|分析|记录|沉淀)\s*(一下|下|下这个文档|这个文档|这篇文章|这篇|这个|内容|知识点|要点)?",
+        r"(这个|这篇|这份|这条|这个文档|这篇文章|这个内容)?\s*(不错|挺好|可以|有用|有价值|mark|先留着|留一下|收藏|看看|看下|学习下)",
+        r"(文档|网页|文章|链接|资料)\s*(总结|整理|归纳|提炼|概括)?",
+    ]
+    for pattern in low_signal_patterns:
+        note = re.sub(pattern, " ", note, flags=re.I)
+    note = re.sub(r"\b(mark|read later|summary|summarize)\b", " ", note, flags=re.I)
+    note = re.sub(r"\s+", " ", note).strip(" -_#:/：")
+    signal = re.sub(r"(文档|网页|文章|内容|资料|知识点|要点|链接|这个|这篇|这份|一下|看看|看下|不错|挺好|可以|有用|学习)", "", note)
+    return note if len(signal.strip()) >= 2 else ""
+
+
+def link_content_insufficient(link: dict) -> bool:
+    provider = str(link.get("provider") or "")
+    if not provider.startswith("http"):
+        return False
+    text = str(link.get("content_markdown") or link.get("excerpt") or "")
+    meaningful = re.sub(r"[<>{}\[\]()/\\|#*`~_\-\s\d.:：，。,.!?！？;；'\"“”‘’]+", "", text)
+    return len(meaningful.strip()) < 24
+
+
 def smart_summary_from_link(user_text: str, link: dict, fetch_error: str = "") -> str:
-    user_note = strip_urls(user_text)
+    provider_label = link.get("provider_label") or "网页"
+    title = link.get("title") or link.get("url", "")
+    excerpt = link.get("excerpt") or markdown_to_summary_text(link.get("content_markdown") or "")
+    intro = link.get("description") or first_link_summary_sentence(excerpt)
+    points = [point for point in link_summary_sentences(excerpt, 4) if point != intro][:3]
     lines = []
-    if user_note:
-        lines.append(f"用户批注：{user_note}")
-        lines.append("")
-    lines.append(f"来源链接：{link.get('url', '')}")
-    if link.get("title"):
-        lines.append(f"网页标题：{link['title']}")
-    if link.get("description"):
-        lines.append("")
-        lines.append("摘要：")
-        lines.append(link["description"])
-    elif link.get("excerpt"):
-        lines.append("")
-        lines.append("摘要：")
-        lines.append(compact_text(link["excerpt"], 320))
-    if link.get("excerpt"):
-        lines.append("")
-        lines.append("正文片段：")
-        lines.append(compact_text(link["excerpt"], 520))
     if fetch_error:
+        lines.append(f"抓取失败：内容暂未完整抓取，已保留来源链接（{fetch_error}）。")
         lines.append("")
-        lines.append(f"解析状态：链接已保留，网页内容暂未抓取成功（{fetch_error}）。")
+    lines.append(f"资料类型：{provider_label}")
+    if title:
+        lines.append(f"标题：{title}")
+    if intro:
+        lines.append("")
+        lines.append(f"简单总结：{compact_text(intro, 220)}")
+    elif fetch_error:
+        lines.append("")
+        lines.append("简单总结：由于正文抓取失败，暂不能生成文档核心内容摘要。")
+    if points:
+        lines.append("")
+        lines.append("关键点：")
+        lines.extend(f"- {point}" for point in points)
+    lines.append("")
+    lines.append(f"来源：{link.get('url', '')}")
     return "\n".join(lines).strip()
 
 
-def enrich_link_memo(content: str) -> dict | None:
+def enrich_link_memo(content: str, settings: dict | None = None) -> dict | None:
     urls = extract_urls(content)
     if not urls:
         return None
     url = urls[0]
     fetch_error = ""
     try:
-        link = fetch_url_metadata(url)
+        if settings and is_lark_doc_url(url):
+            link = fetch_lark_doc_metadata(settings, url)
+        else:
+            link = fetch_url_metadata(url)
     except (urlerror.URLError, TimeoutError, ValueError, OSError) as exc:
         fetch_error = exc.__class__.__name__
-        link = {"url": url, "title": strip_urls(content) or url, "description": "", "excerpt": ""}
-    user_note = strip_urls(content)
+        link = {
+            "url": url,
+            "title": clean_link_request_note(content) or url,
+            "description": "",
+            "excerpt": "",
+            "content_markdown": "",
+            "content_length": 0,
+        }
+    except LarkCliError as exc:
+        fetch_error = f"lark-cli: {str(exc)}"
+        try:
+            link = fetch_url_metadata(url)
+        except (urlerror.URLError, TimeoutError, ValueError, OSError):
+            link = {
+                "url": url,
+                "title": clean_link_request_note(content) or url,
+                "description": "",
+                "excerpt": "",
+                "content_markdown": "",
+                "content_length": 0,
+            }
+        link["provider"] = link.get("provider") or "lark-cli-fallback"
+        link["provider_label"] = "飞书文档"
+    if not fetch_error and link_content_insufficient(link):
+        fetch_error = "网页正文过短，可能需要登录或浏览器抓取"
+        link["excerpt"] = ""
+        link["content_markdown"] = ""
+        link["content_length"] = 0
+    user_note = clean_link_request_note(content)
     title_base = link.get("title") or user_note or url
-    title = clean_title(title_base, "网页资料")
+    title = clean_title(title_base, "链接资料")
     summary = smart_summary_from_link(content, link, fetch_error)
-    combined = "\n".join([content, link.get("title", ""), link.get("description", ""), link.get("excerpt", "")])
+    combined = "\n".join([user_note, link.get("title", ""), link.get("description", ""), link.get("excerpt", "")])
     category = classify_text(combined)
     tags = extract_tags(combined)
     if "网页资料" not in tags:
         tags.append("网页资料")
-    if user_note and "这个内容不错" in user_note and "待读" not in tags:
+    if link.get("provider") == "lark-cli-docs" and "飞书文档" not in tags:
+        tags.append("飞书文档")
+    if user_note and "待读" in user_note and "待读" not in tags:
         tags.append("待读")
     return {
         "url": url,
@@ -824,6 +1133,9 @@ def enrich_link_memo(content: str) -> dict | None:
         "category": category,
         "tags": tags[:8],
         "fetch_error": fetch_error,
+        "fetch_provider": link.get("provider") or "http-html",
+        "summary_skill": "agents/link-summary/SKILL.md",
+        "request_note": user_note,
         "link": link,
     }
 
@@ -2315,10 +2627,97 @@ def normalize_model_cli_payload(payload: dict, content: str, partition: str) -> 
     }
 
 
-def memo_to_inbox_via_model_cli(conn: sqlite3.Connection, settings: dict, content: str, partition: str) -> dict:
-    prompt = model_cli_prompt(content, partition, compact_agent_context(conn))
+def fallback_archive_brief(title: str, content: str) -> dict:
+    plain = strip_urls(re.sub(r"^---[\s\S]*?---\s*", "", content)).strip()
+    summary = first_link_summary_sentence(plain) or compact_text(plain, 180) or title
+    return {
+        "title": clean_title(summary or title, "归档摘要"),
+        "summary": compact_text(summary, 240),
+        "model_used": False,
+        "error": "",
+    }
+
+
+def generate_archive_brief(settings: dict, title: str, content: str) -> dict:
+    fallback = fallback_archive_brief(title, content)
+    prompt = (
+        "你是 Ayla 个人工作台的归档标题生成器。请基于下面的备忘或资料内容，"
+        "输出一个适合卡片展示的一句话中文标题，并给出一句归档摘要。"
+        "要求：只基于原文，不编造；标题 12 到 36 个中文字符；不要使用“总结：”前缀。"
+        "只输出 JSON，格式为 {\"title\":\"...\",\"summary\":\"...\"}。\n\n"
+        f"原始标题：{title}\n"
+        f"内容：{compact_text(content, 1800)}"
+    )
+    try:
+        payload = run_model_cli(settings, prompt)
+    except ModelCliError as exc:
+        if str(settings.get("model_cli") or "").strip().lower() != "claude" and shutil.which("claude"):
+            alt_settings = dict(settings)
+            alt_settings["model_cli"] = "claude"
+            alt_settings["model_cli_command"] = ""
+            try:
+                payload = run_model_cli(alt_settings, prompt)
+            except ModelCliError as alt_exc:
+                fallback["error"] = f"{str(exc)}; claude fallback: {str(alt_exc)}"
+                return fallback
+        else:
+            fallback["error"] = str(exc)
+            return fallback
+    model_title = clean_title(str(payload.get("title") or "").strip(), fallback["title"])
+    model_summary = compact_text(str(payload.get("summary") or "").strip() or model_title, 240)
+    return {
+        "title": model_title,
+        "summary": model_summary,
+        "model_used": True,
+        "error": "",
+    }
+
+
+def model_cli_link_input(content: str, link_enrichment: dict | None) -> str:
+    if not link_enrichment:
+        return content
+    link = link_enrichment.get("link") or {}
+    parts = [
+        content,
+        "",
+        "以下是工作台已抓取到的链接内容，请基于这些内容生成 Ayla candidates，不要只总结 URL 本身：",
+        f"来源链接：{link_enrichment.get('url') or ''}",
+        f"抓取工具：{link_enrichment.get('fetch_provider') or ''}",
+        f"标题：{link_enrichment.get('title') or link.get('title') or ''}",
+        f"摘要草稿：{link_enrichment.get('content') or ''}",
+        f"正文材料：{compact_text(link.get('content_markdown') or link.get('excerpt') or '', 3500)}",
+    ]
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+def memo_to_inbox_via_model_cli(
+    conn: sqlite3.Connection,
+    settings: dict,
+    content: str,
+    partition: str,
+    link_enrichment: dict | None = None,
+) -> dict:
+    model_input = model_cli_link_input(content, link_enrichment)
+    prompt = model_cli_prompt(model_input, partition, compact_agent_context(conn))
     model_payload = run_model_cli(settings, prompt)
-    ingest_payload = normalize_model_cli_payload(model_payload, content, partition)
+    ingest_payload = normalize_model_cli_payload(model_payload, model_input, partition)
+    if link_enrichment:
+        source_url = str(link_enrichment.get("url") or "")
+        ingest_payload["source_url"] = source_url
+        ingest_payload["link_enrichment"] = link_enrichment
+        ingest_payload["title"] = link_enrichment.get("title") or ingest_payload.get("title") or ""
+        ingest_payload["summary"] = str(ingest_payload.get("summary") or "").strip() or link_enrichment.get("content", "")
+        for candidate in ingest_payload.get("candidates") or []:
+            candidate["source_url"] = str(candidate.get("source_url") or source_url)
+            candidate["source_refs"] = as_string_list(candidate.get("source_refs")) or ["link_memo"]
+            tags = coerce_tags(candidate.get("tags"))
+            if link_enrichment.get("fetch_provider") == "lark-cli-docs":
+                if "飞书文档" not in tags:
+                    tags.append("飞书文档")
+                candidate["visibility"] = "internal"
+                if candidate.get("storage_target") == "obsidian_public_vault":
+                    candidate["storage_target"] = "local_state"
+            candidate["tags"] = tags
     result = agent_ingest(conn, ingest_payload)
     audit(
         conn,
@@ -2336,9 +2735,10 @@ def memo_to_inbox_via_model_cli(conn: sqlite3.Connection, settings: dict, conten
 
 def memo_to_inbox(conn: sqlite3.Connection, content: str, partition: str = "") -> dict:
     settings = get_settings(conn)
+    link_enrichment = enrich_link_memo(content, settings)
     if str(settings.get("model_provider") or "") == "model_cli":
         try:
-            return memo_to_inbox_via_model_cli(conn, settings, content, partition)
+            return memo_to_inbox_via_model_cli(conn, settings, content, partition, link_enrichment)
         except ModelCliError as exc:
             audit(
                 conn,
@@ -2347,7 +2747,6 @@ def memo_to_inbox(conn: sqlite3.Connection, content: str, partition: str = "") -
                 None,
                 {"error": str(exc), "provider": settings.get("model_cli")},
             )
-    link_enrichment = enrich_link_memo(content)
     working_content = link_enrichment["content"] if link_enrichment else content
     category = partition or (link_enrichment["category"] if link_enrichment else classify_text(content))
     tags = link_enrichment["tags"] if link_enrichment else extract_tags(content)
@@ -2359,10 +2758,19 @@ def memo_to_inbox(conn: sqlite3.Connection, content: str, partition: str = "") -
         auto_target, item_type, confidence = "note", "note_candidate", 0.84 if not link_enrichment["fetch_error"] else 0.68
     title = link_enrichment["title"] if link_enrichment else clean_title(content, "新备忘")
     source_url = link_enrichment["url"] if link_enrichment else ""
-    source_type = "web_memo" if link_enrichment else "manual_memo"
+    source_type = (
+        "lark_doc_memo"
+        if link_enrichment and link_enrichment.get("fetch_provider") == "lark-cli-docs"
+        else "web_memo"
+        if link_enrichment
+        else "manual_memo"
+    )
     risk_level = "medium" if risk_like else "low"
     visibility = "public" if auto_target == "note" and category in ["学习", "方法论", "可公开"] and not risk_like else "private"
     storage_target = "obsidian_public_vault" if visibility == "public" else "local_state"
+    if link_enrichment and link_enrichment.get("fetch_provider") == "lark-cli-docs":
+        visibility = "internal"
+        storage_target = "local_state"
     policy = confirmation_policy(auto_target, storage_target, risk_level, False, infer_due(content))
     event_id = create_source_event(
         conn,
@@ -2400,8 +2808,9 @@ def memo_to_inbox(conn: sqlite3.Connection, content: str, partition: str = "") -
             "requires_confirmation": True,
             "confirmation_policy": policy,
             "source_url": source_url,
-            "parser_provider": "local-web-parser",
+            "parser_provider": link_enrichment.get("fetch_provider") if link_enrichment else "manual-rules",
             "parser_status": "failed" if link_enrichment and link_enrichment["fetch_error"] else "parsed" if link_enrichment else "none",
+            "summary_skill": link_enrichment.get("summary_skill") if link_enrichment else "",
             "review_date": today_key(),
             "review_status": "pending",
             "suggested_priority": infer_priority(content),
@@ -2677,6 +3086,73 @@ def coerce_projects(value: object) -> list[str]:
     return []
 
 
+def archive_note_body(original_title: str, content: str, archive_brief: dict, source_url: str = "") -> str:
+    lines = [
+        f"归档摘要：{archive_brief.get('summary') or archive_brief.get('title') or original_title}",
+        "",
+        f"原始标题：{original_title}",
+    ]
+    if source_url:
+        lines.extend(["", f"来源链接：{source_url}"])
+    lines.extend(["", "原始内容：", content.strip()])
+    return "\n".join(lines).strip()
+
+
+def link_enrichment_from_metadata(*metadata_objects: dict) -> dict:
+    for metadata in metadata_objects:
+        enrichment = metadata.get("link_enrichment") if isinstance(metadata, dict) else None
+        if isinstance(enrichment, dict):
+            return enrichment
+    return {}
+
+
+def refresh_link_enrichment(settings: dict, enrichment: dict) -> tuple[dict, bool]:
+    url = str(enrichment.get("url") or "").strip()
+    if not url:
+        return enrichment, False
+    link = enrichment.get("link") if isinstance(enrichment.get("link"), dict) else {}
+    full_markdown = str(link.get("content_markdown") or "").strip()
+    if len(full_markdown) >= 1200:
+        return enrichment, False
+    try:
+        fresh_link = fetch_lark_doc_metadata(settings, url) if is_lark_doc_url(url) else fetch_url_metadata(url)
+    except (LarkCliError, urlerror.URLError, TimeoutError, ValueError, OSError):
+        return enrichment, False
+    refreshed = dict(enrichment)
+    refreshed["link"] = {**link, **fresh_link}
+    refreshed["title"] = clean_title(str(fresh_link.get("title") or enrichment.get("title") or url), "链接资料")
+    refreshed["fetch_error"] = ""
+    refreshed["fetch_provider"] = fresh_link.get("provider") or enrichment.get("fetch_provider") or ""
+    refreshed["content"] = smart_summary_from_link("", fresh_link, "")
+    return refreshed, True
+
+
+def link_full_markdown_body(title: str, summary: str, enrichment: dict, source_url: str) -> str:
+    link = enrichment.get("link") if isinstance(enrichment.get("link"), dict) else {}
+    provider_label = link.get("provider_label") or ("飞书文档" if is_lark_doc_url(source_url) else "网页")
+    source_title = link.get("title") or title
+    fetch_error = str(enrichment.get("fetch_error") or "").strip()
+    full_markdown = trim_markdown(str(link.get("content_markdown") or "").strip())
+    if not full_markdown:
+        full_markdown = trim_markdown(str(link.get("excerpt") or "").strip())
+    if not full_markdown:
+        return summary
+    brief = summary.strip()
+    lines = [
+        f"资料类型：{provider_label}",
+        f"来源标题：{source_title}",
+        f"来源链接：{source_url}",
+    ]
+    if fetch_error:
+        lines.append(f"抓取状态：抓取不完整（{fetch_error}）")
+    else:
+        lines.append(f"抓取状态：已抓取并转换为 Markdown，正文约 {len(full_markdown)} 字符")
+    if brief:
+        lines.extend(["", "## 简要摘要", brief])
+    lines.extend(["", "## 原文内容", full_markdown])
+    return "\n".join(lines).strip()
+
+
 def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
     item = conn.execute("SELECT * FROM inbox_items WHERE id = ?", (item_id,)).fetchone()
     if not item:
@@ -2684,6 +3160,8 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
     event = conn.execute("SELECT * FROM source_events WHERE id = ?", (item["source_event_id"],)).fetchone()
     item_data = row_to_dict(item)
     metadata = item_data.get("metadata") or {}
+    event_data = row_to_dict(event) if event else {}
+    event_metadata = event_data.get("metadata") or {}
     settings = get_settings(conn)
     tags = coerce_tags(payload.get("tags"))
     tags = tags or metadata.get("tags") or []
@@ -2703,9 +3181,24 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
     created_at = now_iso()
     source_label = event["title"] if event else item["source_event_id"]
     source_url = event["source_url"] if event else ""
+    archive_brief = payload.get("archive_brief") if isinstance(payload.get("archive_brief"), dict) else {}
+    body_content = payload.get("content") or item["content"]
+    link_enrichment = link_enrichment_from_metadata(metadata, event_metadata)
+    if link_enrichment:
+        link_enrichment, refreshed = refresh_link_enrichment(settings, link_enrichment)
+        if refreshed and event:
+            event_metadata["link_enrichment"] = link_enrichment
+            conn.execute(
+                "UPDATE source_events SET metadata = ? WHERE id = ?",
+                (json.dumps(event_metadata, ensure_ascii=False), event["id"]),
+            )
+        body_content = link_full_markdown_body(title, body_content, link_enrichment, source_url)
+    if archive_brief:
+        title = archive_brief.get("title") or title
+        body_content = archive_note_body(item["title"], body_content, archive_brief, source_url)
     markdown = note_markdown(
         title,
-        payload.get("content") or item["content"],
+        body_content,
         payload.get("type") or category,
         tags,
         projects,
@@ -2713,11 +3206,11 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
         source_url,
         sensitivity,
         publishable,
-            visibility,
-            storage_target,
-            created_at,
-            owner_metadata(settings),
-        )
+        visibility,
+        storage_target,
+        created_at,
+        owner_metadata(settings),
+    )
     path = write_note_file(settings, category, title, markdown, storage_target, visibility)
     note_id = new_id("note")
     conn.execute(
@@ -2746,6 +3239,19 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
     metadata["materialized_note_id"] = note_id
     metadata["materialized_path"] = str(path)
     metadata["materialized_at"] = created_at
+    metadata["asset_url"] = f"/api/notes/{note_id}/raw"
+    if source_url:
+        metadata["source_url"] = source_url
+    if link_enrichment:
+        link = link_enrichment.get("link") if isinstance(link_enrichment.get("link"), dict) else {}
+        metadata["full_markdown_saved"] = bool(link.get("content_markdown") or link.get("excerpt"))
+        metadata["full_markdown_length"] = int(link.get("content_length") or len(str(link.get("content_markdown") or link.get("excerpt") or "")))
+    if archive_brief:
+        metadata["archive_title"] = archive_brief.get("title") or title
+        metadata["archive_summary"] = archive_brief.get("summary") or archive_brief.get("title") or title
+        metadata["archive_model_used"] = bool(archive_brief.get("model_used"))
+        if archive_brief.get("error"):
+            metadata["archive_model_error"] = archive_brief.get("error")
     conn.execute(
         "UPDATE inbox_items SET status = '已确认', metadata = ?, updated_at = ? WHERE id = ?",
         (json.dumps(metadata, ensure_ascii=False), created_at, item_id),
@@ -2753,6 +3259,97 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
     resolve_pending_confirmations(conn, "inbox_item", item_id, "confirmed")
     audit(conn, "confirm_note", "note", note_id, {"inbox_item_id": item_id, "path": str(path)})
     return {"note_id": note_id, "path": str(path)}
+
+
+def archive_memo_item(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
+    item = conn.execute("SELECT * FROM inbox_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        raise KeyError("inbox item not found")
+    event = conn.execute("SELECT * FROM source_events WHERE id = ?", (item["source_event_id"],)).fetchone()
+    item_data = row_to_dict(item)
+    metadata = item_data.get("metadata") or {}
+    settings = get_settings(conn)
+    original_title = str(payload.get("title") or item["title"]).strip()
+    content = str(payload.get("content") or item["content"]).strip()
+    archive_brief = generate_archive_brief(settings, original_title, content)
+    category = str(payload.get("category") or item["suggested_category"] or "归档").strip()
+    tags = coerce_tags(payload.get("tags")) or metadata.get("tags") or []
+    if "每日归档" not in tags:
+        tags.append("每日归档")
+    project = str(payload.get("project_id") or metadata.get("project") or "").strip()
+    projects = [project] if project else []
+    source_url = str(metadata.get("source_url") or (event["source_url"] if event else "") or "")
+    now = now_iso()
+    title = archive_brief.get("title") or original_title
+    body = archive_note_body(original_title, content, archive_brief, source_url)
+    markdown = note_markdown(
+        title,
+        body,
+        "每日归档",
+        tags,
+        projects,
+        event["title"] if event else original_title,
+        source_url,
+        "internal",
+        False,
+        "internal",
+        "local_state",
+        now,
+        owner_metadata(settings),
+    )
+    path = write_note_file(settings, category, title, markdown, "local_state", "internal")
+    note_id = new_id("note")
+    conn.execute(
+        """
+        INSERT INTO notes (
+          id, title, path, content, type, tags, projects, sensitivity,
+          publishable, source_event_ids, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """,
+        (
+            note_id,
+            title,
+            str(path),
+            markdown,
+            "每日归档",
+            json.dumps(tags, ensure_ascii=False),
+            json.dumps(projects, ensure_ascii=False),
+            "internal",
+            json.dumps([item["source_event_id"]], ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    metadata.update(
+        {
+            "materialized_note_id": note_id,
+            "materialized_path": str(path),
+            "materialized_at": now,
+            "asset_url": f"/api/notes/{note_id}/raw",
+            "source_url": source_url,
+            "archive_title": title,
+            "archive_summary": archive_brief.get("summary") or title,
+            "archive_model_used": bool(archive_brief.get("model_used")),
+            "auto_target": "memo",
+            "review_status": "archived",
+        }
+    )
+    if archive_brief.get("error"):
+        metadata["archive_model_error"] = archive_brief.get("error")
+    conn.execute(
+        "UPDATE inbox_items SET status = '已归档', metadata = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(metadata, ensure_ascii=False), now, item_id),
+    )
+    resolve_pending_confirmations(conn, "inbox_item", item_id, "archived")
+    audit(
+        conn,
+        "archive_memo_item",
+        "note",
+        note_id,
+        {"inbox_item_id": item_id, "path": str(path), "model_used": bool(archive_brief.get("model_used"))},
+    )
+    return {"note_id": note_id, "path": str(path), "title": title, "summary": metadata["archive_summary"]}
 
 
 def apply_inbox_override(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
@@ -3148,6 +3745,61 @@ def delete_note(conn: sqlite3.Connection, note_id: str) -> dict:
     return {"id": note_id, "deleted_file": deleted_file}
 
 
+def dismiss_link_summary(conn: sqlite3.Connection, source_event_id: str) -> dict:
+    event_row = conn.execute("SELECT * FROM source_events WHERE id = ?", (source_event_id,)).fetchone()
+    if not event_row:
+        raise KeyError("link summary not found")
+    event = row_to_dict(event_row)
+    if event.get("source_type") not in ["web_memo", "lark_doc_memo", "local_web_model_cli"]:
+        raise ValueError("source event is not a link summary")
+    inbox_items = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM inbox_items WHERE source_event_id = ?", (source_event_id,)).fetchall()
+    ]
+    note_ids = set()
+    for note_row in conn.execute("SELECT id, source_event_ids FROM notes").fetchall():
+        note = row_to_dict(note_row)
+        if source_event_id in (note.get("source_event_ids") or []):
+            note_ids.add(note["id"])
+    for item in inbox_items:
+        metadata = item.get("metadata") or {}
+        for key in ["materialized_note_id", "memory_note_id"]:
+            note_id = str(metadata.get(key) or "").strip()
+            if note_id:
+                note_ids.add(note_id)
+    deleted_notes = []
+    for note_id in sorted(note_ids):
+        try:
+            deleted_notes.append(delete_note(conn, note_id))
+        except KeyError:
+            continue
+    inbox_ids = [item["id"] for item in inbox_items]
+    if inbox_ids:
+        placeholders = ",".join("?" for _ in inbox_ids)
+        conn.execute(
+            f"DELETE FROM confirmations WHERE target_type = 'inbox_item' AND target_id IN ({placeholders})",
+            inbox_ids,
+        )
+        conn.execute(f"DELETE FROM inbox_items WHERE id IN ({placeholders})", inbox_ids)
+    conn.execute("DELETE FROM confirmations WHERE source_ref = ?", (source_event_id,))
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    metadata["link_summary_hidden"] = True
+    metadata["dismissed_at"] = now_iso()
+    metadata["dismiss_reason"] = "useless"
+    conn.execute(
+        "UPDATE source_events SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata, ensure_ascii=False), source_event_id),
+    )
+    result = {
+        "source_event_id": source_event_id,
+        "deleted_notes": len(deleted_notes),
+        "deleted_inbox_items": len(inbox_ids),
+        "hidden": True,
+    }
+    audit(conn, "dismiss_link_summary", "source_event", source_event_id, result)
+    return result
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> dict:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not row:
@@ -3169,17 +3821,20 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> dict:
 
 def update_settings(conn: sqlite3.Connection, payload: dict) -> dict:
     now = now_iso()
+    values = {key: payload.get(key) for key in DEFAULT_SETTINGS if key in payload}
+    if "asset_root_path" in values:
+        values.update(asset_path_settings(values["asset_root_path"]))
     for key in DEFAULT_SETTINGS:
-        if key in payload:
+        if key in values:
             conn.execute(
                 """
                 INSERT INTO settings (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                 """,
-                (key, json.dumps(payload[key], ensure_ascii=False), now),
+                (key, json.dumps(values[key], ensure_ascii=False), now),
             )
-    audit(conn, "update_settings", "settings", "global", {key: payload.get(key) for key in DEFAULT_SETTINGS if key in payload})
+    audit(conn, "update_settings", "settings", "global", values)
     return get_settings(conn)
 
 
@@ -3561,6 +4216,7 @@ def agent_ingest(conn: sqlite3.Connection, payload: dict) -> dict:
     tool_actions = as_dict_list(payload.get("tool_actions") or payload.get("tool_calls"))
     questions = as_string_list(payload.get("questions"))
     candidates = as_dict_list(payload.get("candidates"))
+    link_enrichment = payload.get("link_enrichment") if isinstance(payload.get("link_enrichment"), dict) else {}
     if not candidates:
         candidates = [legacy_candidate_from_payload(payload, title, base_content, category, fallback_target)]
     source_type = str(payload.get("source") or "openclaw_agent").strip() or "openclaw_agent"
@@ -3575,6 +4231,7 @@ def agent_ingest(conn: sqlite3.Connection, payload: dict) -> dict:
         metadata={
             "agent_payload": payload,
             "category": category,
+            "link_enrichment": link_enrichment,
             "reasoning_hint": payload.get("reasoning_hint") or payload.get("reason") or "",
             "questions": questions,
             "tool_actions": tool_actions,
@@ -3769,6 +4426,89 @@ def active_task(task: dict) -> bool:
     return task.get("status") not in ["已完成", "已取消", "已归档"]
 
 
+def source_event_hidden(event: dict) -> bool:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    return bool(metadata.get("link_summary_hidden") or metadata.get("dismissed"))
+
+
+def note_preview_from_markdown(markdown: str) -> str:
+    content = re.sub(r"^---[\s\S]*?---\s*", "", str(markdown or "")).strip()
+    content = re.sub(r"^# .+$", "", content, count=1, flags=re.M).strip()
+    return compact_text(content, 220)
+
+
+def archive_display_title(title: str, summary: str) -> str:
+    raw = str(title or "").strip()
+    if raw.startswith("http://") or raw.startswith("https://"):
+        cleaned = re.sub(r"(你的备注|用户批注|资料类型|网页标题|标题|简单总结|摘要|来源链接|来源)[:：]", " ", summary)
+        cleaned = URL_RE.sub(" ", cleaned)
+        cleaned = re.sub(r"[<>]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return clean_title(cleaned, raw[:48])
+    return raw or clean_title(summary, "归档资产")
+
+
+def archive_assets_payload(conn: sqlite3.Connection, auto_archived: list[dict], events: list[dict]) -> list[dict]:
+    notes = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM notes ORDER BY updated_at DESC LIMIT 300").fetchall()
+    ]
+    notes_by_id = {note["id"]: note for note in notes}
+    event_ids = {event["id"] for event in events}
+    assets = []
+    seen = set()
+    for item in auto_archived:
+        metadata = item.get("metadata") or {}
+        note_id = str(metadata.get("materialized_note_id") or metadata.get("memory_note_id") or "").strip()
+        note = notes_by_id.get(note_id) if note_id else None
+        if not note:
+            for candidate in notes:
+                source_ids = candidate.get("source_event_ids") or []
+                if item.get("source_event_id") in source_ids:
+                    note = candidate
+                    note_id = candidate["id"]
+                    break
+        if not note or note_id in seen:
+            continue
+        seen.add(note_id)
+        summary = metadata.get("archive_summary") or note_preview_from_markdown(note.get("content") or item.get("content") or "")
+        assets.append(
+            {
+                "id": note_id,
+                "inbox_item_id": item.get("id"),
+                "title": archive_display_title(metadata.get("archive_title") or note.get("title") or item.get("title"), summary),
+                "summary": summary,
+                "asset_url": metadata.get("asset_url") or f"/api/notes/{note_id}/raw",
+                "source_url": metadata.get("source_url") or "",
+                "type": note.get("type") or item.get("item_type"),
+                "updated_at": note.get("updated_at") or item.get("updated_at"),
+                "model_used": bool(metadata.get("archive_model_used")),
+            }
+        )
+    for note in notes:
+        if note["id"] in seen:
+            continue
+        source_ids = set(note.get("source_event_ids") or [])
+        if not source_ids.intersection(event_ids):
+            continue
+        seen.add(note["id"])
+        summary = note_preview_from_markdown(note.get("content") or "")
+        assets.append(
+            {
+                "id": note["id"],
+                "inbox_item_id": "",
+                "title": archive_display_title(note.get("title"), summary),
+                "summary": summary,
+                "asset_url": f"/api/notes/{note['id']}/raw",
+                "source_url": "",
+                "type": note.get("type"),
+                "updated_at": note.get("updated_at"),
+                "model_used": False,
+            }
+        )
+    return sorted(assets, key=lambda item: item.get("updated_at") or "", reverse=True)[:30]
+
+
 def daily_archive_payload(conn: sqlite3.Connection, date_key: str | None = None) -> dict:
     date_key = date_key or today_key()
     events = [
@@ -3798,7 +4538,8 @@ def daily_archive_payload(conn: sqlite3.Connection, date_key: str | None = None)
     memo_events = [
         event
         for event in events
-        if event.get("source_type") in ["manual_memo", "web_memo", "local_web_model_cli", "feishu_summary_mock"]
+        if event.get("source_type") in ["manual_memo", "web_memo", "lark_doc_memo", "local_web_model_cli", "feishu_summary_mock"]
+        and not source_event_hidden(event)
     ]
     auto_archived = [
         item
@@ -3810,15 +4551,18 @@ def daily_archive_payload(conn: sqlite3.Connection, date_key: str | None = None)
         for item in inbox
         if item.get("status") in ["自动分类", "待确认", "需补充", "未处理"]
     ]
+    assets = archive_assets_payload(conn, auto_archived, memo_events)
     return {
         "date": date_key,
         "events": memo_events,
         "auto_archived": auto_archived,
         "adjustable": adjustable,
+        "assets": assets,
         "counts": {
             "events": len(memo_events),
             "auto_archived": len(auto_archived),
             "adjustable": len(adjustable),
+            "assets": len(assets),
         },
     }
 
@@ -3949,17 +4693,22 @@ def confirm_daily_review(conn: sqlite3.Connection, payload: dict) -> dict:
             )
             result["todo"] += 1
         elif target == "note":
+            settings = get_settings(conn)
+            note_content = override.get("content") or item["content"]
+            note_title = override.get("title") or item["title"]
+            archive_brief = generate_archive_brief(settings, note_title, note_content)
             confirm_note(
                 conn,
                 item["id"],
                 {
-                    "title": override.get("title"),
-                    "content": override.get("content"),
+                    "title": archive_brief.get("title") or note_title,
+                    "content": note_content,
                     "category": override.get("category"),
                     "tags": override.get("tags"),
                     "projects": [override.get("project_id")] if override.get("project_id") else [],
                     "storage_target": override.get("storage_target"),
                     "visibility": override.get("visibility"),
+                    "archive_brief": archive_brief,
                 },
             )
             result["note"] += 1
@@ -3975,7 +4724,7 @@ def confirm_daily_review(conn: sqlite3.Connection, payload: dict) -> dict:
             update_inbox_status(conn, item["id"], "已确认")
             result["pinned"] += 1
         else:
-            update_inbox_status(conn, item["id"], "已归档")
+            archive_memo_item(conn, item["id"], override)
             result["archived"] += 1
     audit(conn, "confirm_daily_review", "daily_review", review_date, result)
     return result
@@ -4006,6 +4755,194 @@ def orchestration_payload(settings: dict) -> dict:
             "P3 资产化复盘：周报、月报、季度总结草稿和公开知识图谱。",
         ],
     }
+
+
+def link_summary_display_text(summary: str, failed: bool = False, fetch_error: str = "") -> str:
+    cleaned_lines = []
+    for line in str(summary or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^(你的备注|用户批注)[:：]", stripped):
+            continue
+        if re.match(r"^(总结下|整理下|这个不错|这个文档不错|帮我看看|学习下|mark)$", stripped, flags=re.I):
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines).strip()
+    if failed and "抓取失败" not in cleaned:
+        reason = fetch_error or "内容暂未完整抓取"
+        cleaned = f"抓取失败：内容暂未完整抓取，已保留来源链接（{reason}）。\n\n{cleaned}".strip()
+    return cleaned
+
+
+def note_fetch_warning(conn: sqlite3.Connection, note: dict) -> str:
+    reasons = []
+    source_ids = note.get("source_event_ids") or []
+    for source_id in source_ids:
+        event_row = conn.execute("SELECT * FROM source_events WHERE id = ?", (source_id,)).fetchone()
+        if event_row:
+            event = row_to_dict(event_row)
+            metadata = event.get("metadata") or {}
+            enrichment = metadata.get("link_enrichment") if isinstance(metadata.get("link_enrichment"), dict) else {}
+            fetch_error = str(enrichment.get("fetch_error") or "").strip()
+            if fetch_error:
+                reasons.append(fetch_error)
+        inbox_rows = conn.execute("SELECT * FROM inbox_items WHERE source_event_id = ?", (source_id,)).fetchall()
+        for inbox_row in inbox_rows:
+            item = row_to_dict(inbox_row)
+            metadata = item.get("metadata") or {}
+            if metadata.get("parser_status") == "failed":
+                reasons.append(str(metadata.get("fetch_error") or metadata.get("parser_error") or "内容暂未完整抓取"))
+    content = str(note.get("content") or "")
+    for pattern in [
+        r"抓取失败[：:]\s*([^\n]+)",
+        r"抓取状态[：:][^\n]*?（(.+?)）",
+        r"解析状态[：:][^\n]*?（(.+?)）",
+    ]:
+        match = re.search(pattern, content)
+        if match:
+            reasons.append(match.group(1).strip())
+    clean_reasons = []
+    seen = set()
+    for reason in reasons:
+        reason = compact_text(str(reason or "").strip(), 360)
+        if reason and reason not in seen:
+            clean_reasons.append(reason)
+            seen.add(reason)
+    return clean_reasons[0] if clean_reasons else ""
+
+
+def note_asset_html(note: dict, warning: str = "") -> bytes:
+    title = str(note.get("title") or "归档资产")
+    markdown = str(note.get("content") or "")
+    warning_html = ""
+    if warning:
+        warning_html = (
+            '<section class="warning">'
+            "<strong>抓取失败</strong>"
+            f"<p>内容暂未完整抓取，已保留来源链接。原因：{html.escape(warning)}</p>"
+            "</section>"
+        )
+    document = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #f5f7fb;
+      --paper: #fff;
+      --ink: #1d1d1f;
+      --muted: #6e7681;
+      --line: rgba(60, 60, 67, 0.14);
+      --danger: #ff3b30;
+      --danger-soft: rgba(255, 59, 48, 0.12);
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #111113;
+        --paper: #1c1c1e;
+        --ink: #f5f5f7;
+        --muted: #a1a1aa;
+        --line: rgba(235, 235, 245, 0.12);
+        --danger-soft: rgba(255, 69, 58, 0.18);
+      }}
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.65 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }}
+    main {{
+      box-sizing: border-box;
+      width: min(960px, calc(100vw - 32px));
+      margin: 32px auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--paper);
+      padding: 24px;
+    }}
+    h1 {{
+      margin: 0 0 16px;
+      font-size: 22px;
+      line-height: 1.35;
+    }}
+    .warning {{
+      margin: 0 0 18px;
+      border: 1px solid rgba(255, 59, 48, 0.28);
+      border-radius: 12px;
+      background: var(--danger-soft);
+      color: var(--danger);
+      padding: 12px 14px;
+    }}
+    .warning strong {{
+      display: block;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }}
+    .warning p {{
+      margin: 0;
+      font-weight: 650;
+    }}
+    pre {{
+      margin: 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--ink);
+      font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }}
+    .hint {{
+      color: var(--muted);
+      margin: 0 0 14px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(title)}</h1>
+    {warning_html}
+    <p class="hint">Markdown 资产预览</p>
+    <pre>{html.escape(markdown)}</pre>
+  </main>
+</body>
+</html>"""
+    return document.encode("utf-8")
+
+
+def link_summaries_payload(events: list[dict]) -> list[dict]:
+    summaries = []
+    for event in events:
+        if source_event_hidden(event):
+            continue
+        source_url = str(event.get("source_url") or "").strip()
+        if not source_url:
+            continue
+        source_type = str(event.get("source_type") or "")
+        if source_type not in ["web_memo", "lark_doc_memo", "local_web_model_cli"]:
+            continue
+        metadata = event.get("metadata") or {}
+        enrichment = metadata.get("link_enrichment") if isinstance(metadata.get("link_enrichment"), dict) else {}
+        link = enrichment.get("link") if isinstance(enrichment.get("link"), dict) else {}
+        fetch_error = str(enrichment.get("fetch_error") or "")
+        failed = bool(fetch_error or metadata.get("parser_status") == "failed")
+        summary = link_summary_display_text(event.get("content") or enrichment.get("content") or "", failed, fetch_error)
+        summaries.append(
+            {
+                "id": event.get("id"),
+                "title": event.get("title") or link.get("title") or source_url,
+                "summary": summary,
+                "source_url": source_url,
+                "provider": enrichment.get("fetch_provider") or link.get("provider") or "link",
+                "provider_label": link.get("provider_label") or ("飞书文档" if source_type == "lark_doc_memo" else "网页"),
+                "failed": failed,
+                "fetch_error": fetch_error or ("内容暂未完整抓取" if failed else ""),
+                "created_at": event.get("created_at") or event.get("collected_at"),
+                "updated_at": event.get("collected_at") or event.get("created_at"),
+            }
+        )
+    return summaries[:12]
 
 
 def state_payload(conn: sqlite3.Connection) -> dict:
@@ -4055,6 +4992,7 @@ def state_payload(conn: sqlite3.Connection) -> dict:
         "tasks": tasks,
         "notes": notes,
         "events": events,
+        "link_summaries": link_summaries_payload(events),
         "pinned_slots": get_pinned_slots(conn),
         "daily_review": daily_review_payload(conn),
         "daily_archive": daily_archive_payload(conn),
@@ -4133,11 +5071,23 @@ class AgentHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/notes/") and parsed.path.endswith("/raw"):
             note_id = parsed.path.split("/")[-2]
             with db_connect() as conn:
-                row = conn.execute("SELECT content FROM notes WHERE id = ?", (note_id,)).fetchone()
+                row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
                 if not row:
                     self.send_error_json("note not found", HTTPStatus.NOT_FOUND)
                     return
-                data = row["content"].encode("utf-8")
+                note = row_to_dict(row)
+                accept = self.headers.get("Accept", "")
+                wants_markdown = "format=markdown" in parsed.query or "raw=1" in parsed.query
+                wants_html = "text/html" in accept and not wants_markdown
+                if wants_html:
+                    data = note_asset_html(note, note_fetch_warning(conn, note))
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                data = str(note.get("content") or "").encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/markdown; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -4323,6 +5273,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 match = re.match(r"^/api/notes/([^/]+)$", parsed.path)
                 if match:
                     result = delete_note(conn, unquote(match.group(1)))
+                    conn.commit()
+                    self.send_json(result)
+                    return
+                match = re.match(r"^/api/link-summaries/([^/]+)$", parsed.path)
+                if match:
+                    result = dismiss_link_summary(conn, unquote(match.group(1)))
                     conn.commit()
                     self.send_json(result)
                     return

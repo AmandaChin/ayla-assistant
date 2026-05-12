@@ -1,4 +1,5 @@
-agent-vault/
+# Local-only Ayla assets and SQLite state. Do not upload to GitHub.
+/agent-vault/
 __pycache__/
 *.pyc
 .DS_Store

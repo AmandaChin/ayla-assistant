@@ -81,6 +81,7 @@ const brandAccountEl = document.querySelector("#brand-account");
 const userAvatarEl = document.querySelector("#user-avatar");
 const userNameEl = document.querySelector("#user-name");
 const userHandleEl = document.querySelector("#user-handle");
+let toastTimer = 0;
 
 function applyChromeState() {
   state.theme = themeFromMode(state.prefs.uiMode || state.theme);
@@ -157,10 +158,29 @@ function formatDateOnly(value) {
   });
 }
 
-function showToast(message) {
+function showToast(message, options = {}) {
+  const { tone = "", duration = 2200 } = options;
+  window.clearTimeout(toastTimer);
   toastEl.textContent = message;
+  toastEl.classList.remove("info", "success", "warning");
+  if (tone) toastEl.classList.add(tone);
   toastEl.classList.add("show");
-  window.setTimeout(() => toastEl.classList.remove("show"), 2200);
+  toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), duration);
+}
+
+function isModelOrganizeEnabled() {
+  return Boolean(state.data?.model_cli_status?.enabled);
+}
+
+function setFormBusy(form, busy, label = "处理中") {
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) {
+    if (!submit.dataset.idleText) submit.dataset.idleText = submit.textContent;
+    submit.disabled = busy;
+    submit.textContent = busy ? label : submit.dataset.idleText;
+  }
+  form.classList.toggle("is-submitting", busy);
+  form.setAttribute("aria-busy", String(busy));
 }
 
 function notificationSupported() {
@@ -374,6 +394,15 @@ function isTodayRecord(item) {
 function notePreview(note) {
   const content = String(note.content || "").replace(/^---[\s\S]*?---\s*/, "").trim();
   return content || note.path || "已写入本地资料库";
+}
+
+function summaryPreview(value, limit = 180) {
+  const text = String(value || "")
+    .replace(/^---[\s\S]*?---\s*/, "")
+    .replace(/^# .+$/m, "")
+    .replace(/\n来源：https?:\/\/\S+/g, "")
+    .trim();
+  return text.length > limit ? `${text.slice(0, limit).trim()}...` : text;
 }
 
 function isActiveTask(task) {
@@ -698,8 +727,8 @@ function renderAiSummaryCard() {
   const pendingInbox = (state.data.inbox || []).filter((item) => !["已确认", "已忽略", "已归档", "已发布"].includes(item.status));
   const recentRuns = state.data.agent_runs || [];
   const lead = log.summary || log.generated_report || "今天的输入会被整理成候选、TODO 和本地工作沉淀，等待你确认。";
-  const archivedMaterials = (state.data.notes || []).filter(isTodayRecord).slice(0, 3);
   const knownTodos = todayRelevantTasks().filter(isActiveTask).slice(0, 2);
+  const linkSummaries = (state.data.link_summaries || []).slice(0, 3);
   return `
     <article class="card span-7 ai-summary-card">
       <div class="card-header">
@@ -727,22 +756,26 @@ function renderAiSummaryCard() {
         </section>
         <section class="ai-zone">
           <div class="ai-zone-head">
-            <div><h4>已归档资料</h4><span>已识别为资料的内容会进入今日总结，可按需移除。</span></div>
-            <span class="pill">Asset Ready</span>
+            <div><h4>链接总结</h4><span>飞书文档 / 网页资料</span></div>
+            <span class="pill">Link Brief</span>
           </div>
           <div class="ai-action-list">
-            ${archivedMaterials.length ? archivedMaterials.map((item) => `
-              <article class="ai-action-item">
+            ${linkSummaries.length ? linkSummaries.map((item) => `
+              <article class="ai-action-item ${item.failed ? "is-warning" : ""}">
                 <div class="ai-action-main">
                   <div>
                     <strong>${escapeHtml(item.title)}</strong>
-                    <p>${escapeHtml(notePreview(item))}</p>
+                    <p>${escapeHtml(summaryPreview(item.summary, 220))}</p>
+                    ${item.failed ? `<p class="link-fetch-warning">抓取失败：${escapeHtml(item.fetch_error || "内容暂未完整抓取")}</p>` : ""}
                   </div>
-                  <button class="button secondary" data-action="remove-ai-archive" data-id="${escapeHtml(item.id)}" type="button">移除资料</button>
+                  <div class="link-summary-actions">
+                    ${sourceLink(item.source_url)}
+                    <button class="button tiny warning" data-action="remove-link-summary" data-id="${escapeHtml(item.id)}" type="button">无用</button>
+                  </div>
                 </div>
-                <div class="meta-line">${metaPill(item.publishable ? "公开知识" : "本地资料", "violet")}${metaPill(item.type || "已归档", "green")}</div>
+                <div class="meta-line">${metaPill(item.failed ? "抓取失败" : item.provider_label || "链接", item.failed ? "coral" : item.provider === "lark-cli-docs" ? "violet" : "green")}${metaPill(formatDate(item.updated_at))}</div>
               </article>
-            `).join("") : `<div class="empty-hint">暂无归档资料</div>`}
+            `).join("") : `<div class="empty-hint">暂无链接总结</div>`}
           </div>
         </section>
         <section class="ai-zone">
@@ -1277,34 +1310,32 @@ function renderDailyLogPanel() {
 }
 
 function renderDailyArchivePanel(compact = true) {
-  const archive = state.data.daily_archive || { events: [], auto_archived: [], adjustable: [], counts: {} };
-  const events = compact ? (archive.events || []).slice(0, 5) : archive.events || [];
-  const adjustable = compact ? (archive.adjustable || []).slice(0, 4) : archive.adjustable || [];
+  const archive = state.data.daily_archive || { events: [], assets: [], auto_archived: [], counts: {} };
+  const assets = compact ? (archive.assets || []).slice(0, 5) : archive.assets || [];
   return `
     <section class="panel">
       <div class="section-head">
         <div>
           <h2>每日备忘归档</h2>
-          <p>${archive.counts?.events || 0} 条输入，${archive.counts?.auto_archived || 0} 条已处理，${archive.counts?.adjustable || 0} 条可调整。</p>
+          <p>${archive.counts?.events || 0} 条输入，${archive.counts?.assets || 0} 条资产。</p>
         </div>
-        <button class="button secondary" ${compact ? 'data-view="memos"' : 'data-action="scroll-daily-review"'} type="button">${compact ? "调整归档" : "编辑归档"}</button>
       </div>
       <div class="archive-grid">
         <div class="archive-column">
-          <h3>今日输入</h3>
+          <h3>归档资产</h3>
           <div class="list compact-list">
-            ${events.length ? events.map((event) => `
-              <article class="archive-row">
-                <strong>${escapeHtml(event.title || "备忘")}</strong>
-                <span>${formatDate(event.collected_at)}</span>
+            ${assets.length ? assets.map((asset) => `
+              <article class="archive-row archive-asset-card">
+                <a class="archive-asset-link" href="${escapeHtml(asset.asset_url)}" target="_blank" rel="noreferrer">
+                  <strong>${escapeHtml(asset.title || "归档资产")}</strong>
+                  <p>${escapeHtml(summaryPreview(asset.summary, 120) || "已写入本地资产库")}</p>
+                </a>
+                <div class="archive-asset-actions">
+                  <span>${asset.model_used ? "LLM 标题" : escapeHtml(asset.type || "资产")}</span>
+                  <button class="button secondary tiny" data-action="remove-ai-archive" data-id="${escapeHtml(asset.id)}" type="button">移除资料</button>
+                </div>
               </article>
-            `).join("") : `<div class="empty">今天还没有备忘输入</div>`}
-          </div>
-        </div>
-        <div class="archive-column">
-          <h3>可调整入口</h3>
-          <div class="list compact-list">
-            ${adjustable.length ? adjustable.map((item) => renderReviewItem(item, true)).join("") : `<div class="empty">暂无需要调整的归档项</div>`}
+            `).join("") : `<div class="empty">暂无归档资产</div>`}
           </div>
         </div>
       </div>
@@ -2083,6 +2114,7 @@ function renderSettings() {
   const larkScopes = larkStatus?.scope_check || {};
   const feishuEnabled = settingEnabled(settings.feishu_enabled);
   const syncDays = Number(settings.lark_sync_days || 7);
+  const assetRootPath = settings.asset_root_path || String(settings.state_root_path || "").replace(/\/LocalWorkState\/?$/, "") || "";
   const prefs = state.prefs;
   const profile = state.data.profile || {};
   const bindingProvider = profile.bound ? "飞书授权人" : "本地演示身份";
@@ -2252,13 +2284,15 @@ function renderSettings() {
 
           <article class="card settings-card span-6">
             <div class="card-header">
-              <div class="card-title"><h3>本地资产路径</h3><span>本地状态、公开知识 Vault 和工作库边界</span></div>
+              <div class="card-title"><h3>本地资产路径</h3><span>默认项目根目录，可自定义本地落库地址</span></div>
               <span class="pill">Local First</span>
             </div>
             <div class="settings-fields">
-              <label>本地 State Root<input class="text-input token-input" name="state_root_path" value="${escapeHtml(settings.state_root_path || "")}" /></label>
-              <label>公开知识 Vault<input class="text-input token-input" name="public_vault_path" value="${escapeHtml(settings.public_vault_path || settings.vault_path || "")}" /></label>
-              <label>本地工作库<input class="text-input token-input" name="work_library_path" value="${escapeHtml(settings.work_library_path || "")}" /></label>
+              <label>本地资产根目录<input class="text-input token-input" name="asset_root_path" value="${escapeHtml(assetRootPath)}" /></label>
+              <p class="muted">默认放在项目目录下的 <code>agent-vault/</code>，已被 <code>.gitignore</code> 忽略，不上传 GitHub。</p>
+              <label>本地 State Root<input class="text-input token-input" readonly value="${escapeHtml(settings.state_root_path || "")}" /></label>
+              <label>公开知识 Vault<input class="text-input token-input" readonly value="${escapeHtml(settings.public_vault_path || settings.vault_path || "")}" /></label>
+              <label>本地工作库<input class="text-input token-input" readonly value="${escapeHtml(settings.work_library_path || "")}" /></label>
               <label>GitHub 仓库<input class="text-input token-input" name="github_repo" value="${escapeHtml(settings.github_repo || "")}" /></label>
             </div>
           </article>
@@ -2322,10 +2356,10 @@ function render() {
   maybeLoadLarkStatus();
 }
 
-async function refresh(message = "") {
+async function refresh(message = "", toastOptions = {}) {
   await loadState();
   render();
-  if (message) showToast(message);
+  if (message) showToast(message, toastOptions);
 }
 
 document.addEventListener("click", async (event) => {
@@ -2516,14 +2550,28 @@ document.addEventListener("click", async (event) => {
       return;
     }
     if (action === "confirm-daily-review") {
-      await api("/api/daily-review/confirm", {
-        method: "POST",
-        body: JSON.stringify({
-          date: actionButton.dataset.date,
-          overrides: collectDailyReviewOverrides(),
-        }),
+      const idleText = actionButton.textContent;
+      actionButton.disabled = true;
+      actionButton.textContent = "归档中";
+      actionButton.setAttribute("aria-busy", "true");
+      showToast("AI 正在生成归档标题，完成后会更新资产卡片", {
+        tone: "info",
+        duration: 4200,
       });
-      await refresh("今日增量已整理");
+      try {
+        await api("/api/daily-review/confirm", {
+          method: "POST",
+          body: JSON.stringify({
+            date: actionButton.dataset.date,
+            overrides: collectDailyReviewOverrides(),
+          }),
+        });
+        await refresh("今日增量已整理，归档资产已更新", { tone: "success" });
+      } finally {
+        actionButton.disabled = false;
+        actionButton.textContent = idleText;
+        actionButton.removeAttribute("aria-busy");
+      }
       return;
     }
     if (action === "use-generated-report") {
@@ -2532,10 +2580,6 @@ document.addEventListener("click", async (event) => {
         report.value = state.data.today_work_log?.generated_report || state.data.today_work_log?.report || "";
         showToast("已恢复自动日报");
       }
-      return;
-    }
-    if (action === "scroll-daily-review") {
-      document.querySelector("#daily-review-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }
     if (action === "add-pinned-slot") {
@@ -2564,6 +2608,11 @@ document.addEventListener("click", async (event) => {
     if (action === "remove-ai-archive") {
       await api(`/api/notes/${encodeURIComponent(id)}`, { method: "DELETE" });
       await refresh("资料已移除");
+      return;
+    }
+    if (action === "remove-link-summary") {
+      await api(`/api/link-summaries/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await refresh("无用资料已删除");
       return;
     }
     if (action === "remove-ai-todo") {
@@ -2745,12 +2794,29 @@ document.addEventListener("submit", async (event) => {
         await refresh("已新增固定便笺");
         return;
       }
-      await api("/api/memos", {
-        method: "POST",
-        body: JSON.stringify(data),
-      });
-      form.reset();
-      await refresh("备忘已自动分类，进入今日整理");
+      const modelOrganize = isModelOrganizeEnabled();
+      setFormBusy(form, true, modelOrganize ? "AI 整理中" : "记录中");
+      if (modelOrganize) {
+        showToast("AI 正在整理这条记录，完成后会自动更新今日整理", {
+          tone: "info",
+          duration: 4200,
+        });
+      }
+      try {
+        const result = await api("/api/memos", {
+          method: "POST",
+          body: JSON.stringify(data),
+        });
+        const modelUsed = Boolean(result?.model_cli?.used);
+        form.reset();
+        setMemoMode(form, "auto");
+        await refresh(
+          modelOrganize || modelUsed ? "AI 整理完成，今日整理已更新" : "备忘已自动分类，进入今日整理",
+          { tone: modelOrganize || modelUsed ? "success" : "" },
+        );
+      } finally {
+        setFormBusy(form, false);
+      }
       return;
     }
     if (kind === "summary") {

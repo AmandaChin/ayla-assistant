@@ -11,12 +11,13 @@
 - 苹果 Notes 风格固定便笺，可长期记录工作信息、待读书清单、常用资料等。
 - 快速备忘支持记录模式切换，可直接新增固定便笺。
 - 快速备忘自动分类为 TODO、知识笔记或普通备忘。
-- 快速备忘包含网页链接时，会自动解析网页标题、描述和正文片段，生成智能标题、摘要和归档建议，并在 Obsidian 笔记中保留 `source_url`。
+- 快速备忘包含飞书文档或网页链接时，会优先用 `lark-cli docs +fetch --api-version v2` 读取飞书正文，普通网页回退到本地网页解析；工作台展示简短链接总结，真正落库的 Study / 知识资产会把抓取到的正文转换成完整 Markdown，并保留 `source_url`。
 - Agent 编排视图，展示 Collector / Orchestrator / Task Extractor / Review / Knowledge Curator 等角色、连接器优先级、待确认动作和最近 AgentRun。
 - `/api/agent/ingest` 支持文档设计里的多候选 `candidates` Schema，可一次写入 TODO、公开知识、工作沉淀、固定便笺和总结素材候选。
 - 新增 `agent_runs` 和 `confirmations` 审计表，低风险本地写入走日维度批量确认，TODO、外部写入、高风险动作进入即时或二次确认。
 - 公开知识与内部工作资料分流：公开、可迁移内容写 `PublicKnowledgeVault`；工作沉淀、会议、实验、TODO 和内部资料默认写 `LocalWorkState`。
 - 今日增量整理，可先编辑标题、内容、目标分类、项目、截止时间等，再按天批量确认自动分类结果。
+- 每日备忘归档会把归档摘要写成本地 Markdown 资产，并用本机模型 CLI 生成一句话标题；今日看板卡片可直接跳转到对应资产。
 - 收件箱候选审核。
 - TODO 候选确认和 TODO 中心编辑。
 - TODO 到期提醒，可通过浏览器通知接入 macOS 通知中心。
@@ -44,7 +45,13 @@ http://127.0.0.1:5173
 
 ## 本地数据
 
-运行后会自动创建：
+运行后会自动创建本地资产目录。正常从项目目录运行时路径是 `./agent-vault/`；在 Codex worktree 中运行时，会优先落到真实项目目录：
+
+```text
+/Users/bytedance/Documents/ayla assistant/agent-vault/
+```
+
+也可以通过 `AYLA_PROJECT_ROOT` 或 `AYLA_VAULT_ROOT` 覆盖资产位置。
 
 ```text
 agent-vault/
@@ -72,7 +79,7 @@ agent-vault/
     database.sqlite
 ```
 
-其中 `agent-vault/` 已写入 `.gitignore`，用于存放个人数据、SQLite 数据库和生成的 Markdown 笔记。
+其中 `/agent-vault/` 已写入 `.gitignore`，用于存放个人数据、SQLite 数据库和生成的 Markdown 笔记，不上传到 GitHub。
 
 ## MVP 流程
 
@@ -128,6 +135,10 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py check-examples
 ```
 
 这个资产的边界是：Orchestrator 负责把输入整理成 Ayla candidates JSON；`server.py` 仍然负责 SourceEvent、InboxItem、AgentRun、Confirmation、落库和审计。
+
+## 链接总结 Skill
+
+`agents/link-summary/SKILL.md` 记录了飞书文档 / 网页链接的抓取顺序和总结格式：飞书文档优先 `lark-cli docs +fetch --api-version v2`，动态网页可接 browser-use / 浏览器 MCP，普通网页回退本地 HTTP 解析；看板总结保持短句、关键点和 `source_url`，落库资产保留完整 Markdown 正文，用于后续搜索、复盘和跳回原链接。
 
 后续迭代多个 Skill 时按最小功能集拆分：上下文读取、payload 校验提交、Inbox 审核、确认策略、快速备忘整理、公开知识路由、本地工作沉淀路由、飞书来源同步和妙记解析都应拆成独立 Skill；Orchestrator 只做总控和 candidates 生成。
 

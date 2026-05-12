@@ -45,6 +45,9 @@ const state = {
   larkStatus: null,
   larkStatusLoading: false,
   larkBinding: null,
+  libraExperiments: null,
+  libraExperimentsLoading: false,
+  libraExperimentsError: "",
   theme: themeFromMode(initialWorkbenchPrefs.uiMode),
   prefs: initialWorkbenchPrefs,
   sidebarCollapsed: localStorage.getItem("aylaSidebarCollapsed") === "true",
@@ -289,6 +292,37 @@ function maybeLoadLarkStatus() {
     });
 }
 
+function maybeLoadLibraExperiments() {
+  if (state.view !== "memos" || state.libraExperiments || state.libraExperimentsLoading || state.libraExperimentsError) return;
+  loadLibraExperiments();
+}
+
+function loadLibraExperiments(force = false) {
+  if (state.libraExperimentsLoading) return Promise.resolve();
+  state.libraExperimentsLoading = true;
+  state.libraExperimentsError = "";
+  const params = new URLSearchParams({
+    limit: "50",
+    owner_type: "my",
+  });
+  if (force) params.set("refresh", "1");
+  return api(`/api/connectors/libra/experiments?${params.toString()}`)
+    .then(async (payload) => {
+      state.libraExperiments = payload;
+      state.libraExperimentsError = payload.ok ? "" : payload.error || "Libra 连接不可用";
+      if (Number(payload.recycle_todos?.created || 0) > 0) {
+        await loadState();
+      }
+      state.libraExperimentsLoading = false;
+      if (state.view === "memos") render();
+    })
+    .catch((error) => {
+      state.libraExperimentsLoading = false;
+      state.libraExperimentsError = error.message;
+      if (state.view === "memos") render();
+    });
+}
+
 function metaPill(label, tone = "") {
   return `<span class="pill ${tone}">${escapeHtml(label)}</span>`;
 }
@@ -474,7 +508,7 @@ function todayRelevantTasks() {
   const today = todayDateKey();
   return (state.data.tasks || [])
     .filter((task) => isActiveTask(task) || isTodayValue(task.due_at) || isTodayValue(task.completed_at) || isTodayValue(task.updated_at))
-    .slice(0, 8);
+    .slice(0, 24);
 }
 
 function renderQuickMemo(variant = "default") {
@@ -1770,6 +1804,82 @@ function renderSparkline(values, index) {
   `;
 }
 
+function libraExperimentUrl(exp) {
+  if (exp.url) return exp.url;
+  if (!exp.id) return "https://data.bytedance.net/libra/flights?app_id=-1&owner_type=my&page=1&page_size=50&search_type=fuzzy";
+  return `https://data.bytedance.net/datatester/app/${encodeURIComponent(exp.app_id || "-1")}/experiment/${encodeURIComponent(exp.id)}/detail`;
+}
+
+function renderLibraExperiments() {
+  const payload = state.libraExperiments;
+  const experiments = (payload?.experiments || []).filter((exp) => exp.status === "进行中" || Number(exp.status_code) === 1);
+  if (state.libraExperimentsLoading && !payload) {
+    return `
+      <div class="experiment-list is-loading">
+        <div class="experiment-list-head"><span>实验名称</span><span>创建时间</span><span>实验标签</span></div>
+        ${Array.from({ length: 3 }).map(() => `
+          <div class="experiment-row skeleton-row">
+            <span></span><span></span><span></span>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+  if (state.libraExperimentsError && !experiments.length) {
+    return `
+      <div class="empty experiment-empty">
+        <strong>Libra 实验读取失败</strong>
+        <span>${escapeHtml(state.libraExperimentsError)}</span>
+      </div>
+    `;
+  }
+  if (!payload) {
+    return `
+      <div class="empty experiment-empty">
+        <strong>准备读取 Libra 实验</strong>
+        <span>将复用当前 Chrome 登录态，仅拉取当前授权账号名下运行中的实验。</span>
+      </div>
+    `;
+  }
+  if (!experiments.length) {
+    return `
+      <div class="empty experiment-empty">
+        <strong>暂无运行中的重点实验</strong>
+        <span>${payload.updated_at ? `最后检查：${formatDate(payload.updated_at)}` : "当前筛选条件没有返回运行中实验。"}</span>
+      </div>
+    `;
+  }
+  const recycle = payload.recycle_todos;
+  const recycleText = recycle
+    ? `超 15 天 ${Number(recycle.eligible || 0)} 个 · 今日回收 TODO ${Number(recycle.created || 0) + Number(recycle.skipped?.duplicate_today || 0)} 条`
+    : "";
+  return `
+    <div class="experiment-list">
+      <div class="experiment-list-head"><span>实验名称</span><span>创建时间</span><span>实验标签</span></div>
+      ${experiments.map((exp) => {
+        const url = libraExperimentUrl(exp);
+        const label = exp.reversal_label || (exp.is_reversal ? "反转实验" : "普通实验");
+        return `
+          <article class="experiment-row">
+            <a class="experiment-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">
+              <strong>${escapeHtml(exp.name || "未命名实验")}</strong>
+              <span>ID ${escapeHtml(exp.id || "")}${exp.layer_name ? ` · ${escapeHtml(exp.layer_name)}` : ""}</span>
+            </a>
+            <div class="experiment-time">${escapeHtml(formatDate(exp.created_time || exp.start_time))}</div>
+            <div class="experiment-tags">
+              <span class="tag ${exp.is_reversal ? "danger" : ""}">${escapeHtml(label)}</span>
+            </div>
+          </article>
+        `;
+      }).join("")}
+      <div class="experiment-footnote">
+        <span>${escapeHtml(payload.cached ? "使用本地短缓存" : "实时读取")}</span>
+        <span>${escapeHtml(recycleText || (payload.updated_at ? formatDate(payload.updated_at) : ""))}</span>
+      </div>
+    </div>
+  `;
+}
+
 function renderMemos() {
   const notes = state.data.notes || [];
   const events = state.data.events || [];
@@ -1789,11 +1899,6 @@ function renderMemos() {
     { title: "Ayla 本地状态", desc: "SourceEvent / TODO / Notes", metrics: [`输入 ${events.length}`, `笔记 ${notes.length}`] },
     { title: "AgentRun 候选", desc: "模型整理与确认队列", metrics: [`运行 ${runs.length}`, `待确认 ${(state.data.confirmations || []).filter((item) => item.decision === "pending").length}`] },
     { title: "飞书数据源", desc: "Calendar / Minutes 只读同步", metrics: [state.larkStatus?.auth?.ok ? "账号已连" : "待检查", `${state.data.settings?.lark_sync_days || 7} 天窗口`] },
-  ];
-  const experiments = [
-    { title: "快速备忘模型整理", status: state.data.model_cli_status?.available ? "进行中" : "风险中", delta: state.data.model_cli_status?.available ? "+18%" : "-6%", positive: Boolean(state.data.model_cli_status?.available) },
-    { title: "飞书日历与妙记同步", status: settingEnabled(state.data.settings?.feishu_enabled) ? "进行中" : "未启用", delta: settingEnabled(state.data.settings?.feishu_enabled) ? "+12%" : "0%", positive: true },
-    { title: "公开知识 Vault 分流", status: notes.some((note) => note.publishable) ? "已完成" : "进行中", delta: `+${notes.filter((note) => note.publishable).length}`, positive: true },
   ];
   const monitors = [
     { title: "待整理候选", value: state.data.stats?.pending_inbox || 0, trend: [4, 5, 5, 7, 6, state.data.stats?.pending_inbox || 0] },
@@ -1838,17 +1943,11 @@ function renderMemos() {
           </div>
         </article>
         <article class="card span-6">
-          <div class="card-header"><div class="card-title"><h3>重点实验</h3><span>与工作台体验直接相关</span></div><span class="pill">实验跟进</span></div>
-          <div class="experiment-grid">
-            ${experiments.map((exp) => `
-              <article class="experiment-card">
-                <strong>${escapeHtml(exp.title)}</strong>
-                <div class="tag ${statusTag(exp.status)}">${escapeHtml(exp.status)}</div>
-                <div class="delta ${exp.positive ? "positive" : "negative"}">${escapeHtml(exp.delta)}</div>
-                <span>核心指标变化</span>
-              </article>
-            `).join("")}
+          <div class="card-header">
+            <div class="card-title"><h3>重点实验</h3><span>当前授权账号 · 仅运行中</span></div>
+            <button class="button secondary tiny" data-action="refresh-libra-experiments" ${state.libraExperimentsLoading ? "disabled" : ""} type="button">${state.libraExperimentsLoading ? "读取中" : "刷新"}</button>
           </div>
+          ${renderLibraExperiments()}
         </article>
         <article class="card span-6">
           <div class="card-header"><div class="card-title"><h3>重点监控</h3><span>含迷你趋势图</span></div><span class="pill">Monitor</span></div>
@@ -2313,6 +2412,7 @@ function render() {
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === state.view);
   });
+  maybeLoadLibraExperiments();
   if (state.view === "dashboard") renderDashboard();
   if (state.view === "okr") renderOkr();
   if (state.view === "memos") renderMemos();
@@ -2493,6 +2593,13 @@ document.addEventListener("click", async (event) => {
       render();
       const ready = state.larkStatus?.available && state.larkStatus?.auth?.ok && state.larkStatus?.scope_check?.ok;
       showToast(ready ? "飞书数据源可用" : "飞书连接需要处理");
+      return;
+    }
+    if (action === "refresh-libra-experiments") {
+      const refreshPromise = loadLibraExperiments(true);
+      render();
+      await refreshPromise;
+      showToast(state.libraExperimentsError || "Libra 重点实验已刷新");
       return;
     }
     if (action === "sync-lark-today" || action === "sync-lark-range") {

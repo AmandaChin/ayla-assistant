@@ -2475,6 +2475,10 @@ html[data-theme="dark"] .notify-button {
   transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
 }
 
+.todo-card.no-source {
+  cursor: default;
+}
+
 .todo-card:hover {
   border-color: rgba(0, 122, 255, 0.22);
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
@@ -2491,6 +2495,7 @@ html[data-theme="dark"] .notify-button {
 
 .todo-card .task-check {
   margin-top: 2px;
+  cursor: pointer;
 }
 
 .todo-card .task-check span {
@@ -3074,6 +3079,90 @@ html[data-theme="dark"] .todo-action {
   color: var(--coral);
 }
 
+.experiment-list {
+  display: grid;
+  gap: 8px;
+}
+
+.experiment-list-head,
+.experiment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px 112px;
+  gap: 12px;
+  align-items: center;
+}
+
+.experiment-list-head {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 820;
+  letter-spacing: 0;
+  padding: 0 12px;
+}
+
+.experiment-row {
+  min-height: 58px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-alt);
+  padding: 10px 12px;
+}
+
+.experiment-link {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.experiment-link:hover strong {
+  color: var(--blue);
+}
+
+.experiment-link strong,
+.experiment-link span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.experiment-link span,
+.experiment-time,
+.experiment-footnote,
+.experiment-empty span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.experiment-time {
+  font-weight: 760;
+}
+
+.experiment-tags {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.experiment-footnote {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 4px;
+}
+
+.experiment-empty {
+  display: grid;
+  gap: 5px;
+}
+
+.skeleton-row span {
+  height: 12px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(142, 160, 186, 0.12), rgba(142, 160, 186, 0.24), rgba(142, 160, 186, 0.12));
+}
+
 .monitor-svg {
   width: 100%;
   height: 72px;
@@ -3541,6 +3630,19 @@ html[data-theme="dark"] .text-input {
   .qr-box {
     width: 100%;
     flex-basis: auto;
+  }
+
+  .experiment-list-head {
+    display: none;
+  }
+
+  .experiment-row {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .experiment-tags {
+    justify-content: flex-start;
   }
 
   .page-hero {

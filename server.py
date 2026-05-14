@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +47,10 @@ LOCAL_STATE_ROOT = VAULT_ROOT / "LocalWorkState"
 PUBLIC_VAULT_ROOT = VAULT_ROOT / "PublicKnowledgeVault"
 RUNTIME_ROOT = VAULT_ROOT / "runtime"
 DB_PATH = VAULT_ROOT / "system" / "database.sqlite"
+LIBRA_CONNECTOR_SCRIPT = ROOT / "agents" / "libra-connector" / "scripts" / "libra_browser_fetch.mjs"
+LIBRA_CACHE_TTL_SECONDS = 300
+LIBRA_RECYCLE_THRESHOLD_DAYS = 15
+LIBRA_EXPERIMENT_CACHE: dict[str, dict] = {}
 
 
 def normalize_user_path(value: object, fallback: Path, base: Path = PROJECT_ROOT) -> Path:
@@ -170,8 +174,8 @@ CONNECTORS = [
     {"name": "飞书 Bot", "priority": "P1", "mode": "主输入入口", "status": "通过 Agent ingest 接入"},
     {"name": "妙记", "priority": "P1", "mode": "会议 TODO 抽取", "status": "lark-cli 只读同步"},
     {"name": "日历", "priority": "P1", "mode": "计划辅助", "status": "lark-cli 只读同步"},
-    {"name": "Libra", "priority": "P2", "mode": "实验状态管理", "status": "待接入"},
-    {"name": "Meego", "priority": "P2", "mode": "需求节点留盘", "status": "待接入"},
+    {"name": "Libra", "priority": "P2", "mode": "实验状态管理", "status": "浏览器桥接只读列表"},
+    {"name": "Meego", "priority": "P2", "mode": "需求节点留盘", "status": "仅保留手动调研 Skill"},
     {"name": "GitHub", "priority": "P3", "mode": "PR 与公开发布", "status": "仅读配置"},
     {"name": "Obsidian", "priority": "P0", "mode": "公开知识 Vault", "status": "本地 Markdown"},
 ]
@@ -1570,6 +1574,351 @@ def lark_connector_status(conn: sqlite3.Connection) -> dict:
         status["todo_scope_check"] = compact_error(exc)
     status["permission_summary"] = lark_permission_summary(status)
     return status
+
+
+def query_value(query: dict[str, list[str]], key: str, default: str) -> str:
+    values = query.get(key)
+    if not values:
+        return default
+    return str(values[0] or default)
+
+
+def libra_cache_key(app_id: str, owner_type: str, page: int, page_size: int, limit: int, visible: bool) -> str:
+    mode = "visible" if visible else "headless"
+    return f"{app_id}:{owner_type}:{page}:{page_size}:{limit}:running:{mode}"
+
+
+def compact_subprocess_text(value: str, limit: int = 900) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)[:limit]
+
+
+def libra_running(row: dict) -> bool:
+    status_code = row.get("status_code")
+    try:
+        if int(status_code) == 1:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(row.get("status") or "").strip() == "进行中"
+
+
+def libra_reversal(row: dict) -> bool:
+    if row.get("is_reversal"):
+        return True
+    try:
+        return int(row.get("reversal_type") or 0) in [1, 2]
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_libra_row(row: dict) -> dict:
+    return {
+        "id": row.get("id") or "",
+        "name": row.get("name") or "未命名实验",
+        "status": row.get("status") or "",
+        "status_code": row.get("status_code"),
+        "created_time": row.get("created_time") or row.get("start_time") or "",
+        "start_time": row.get("start_time") or "",
+        "end_time": row.get("end_time") or "",
+        "owners": row.get("owners") if isinstance(row.get("owners"), list) else [],
+        "creator": row.get("creator") or "",
+        "app_id": row.get("app_id") or "-1",
+        "product_name": row.get("product_name") or "",
+        "layer_name": row.get("layer_name") or "",
+        "is_reversal": bool(row.get("is_reversal")),
+        "reversal_type": row.get("reversal_type"),
+        "reversal_label": row.get("reversal_label") or ("反转实验" if row.get("is_reversal") else "普通实验"),
+        "reversal_key": row.get("reversal_key") or "",
+        "url": row.get("url") or "",
+    }
+
+
+def parse_libra_datetime(value: object) -> datetime | None:
+    if value in [None, ""]:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OSError, OverflowError, ValueError):
+            return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    for fmt in [
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.fromisoformat(raw.replace("/", "-").replace(" ", "T"))
+    except ValueError:
+        return None
+    if parsed.tzinfo:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def today_18_deadline() -> str:
+    return f"{today_key()}T18:00"
+
+
+def libra_recycle_source_id(experiment_id: object, date_key: str) -> str:
+    return f"libra:experiment:{experiment_id}:recycle:{date_key}"
+
+
+def libra_recycle_title(row: dict) -> str:
+    name = str(row.get("name") or "未命名实验").strip()
+    return truncate_text(f"实验回收 TODO：{name}", 96)
+
+
+def libra_recycle_description(row: dict, created_at: datetime, age_days: int) -> str:
+    owners = row.get("owners") if isinstance(row.get("owners"), list) else []
+    parts = [
+        f"Libra 实验已运行 {age_days} 天，超过 {LIBRA_RECYCLE_THRESHOLD_DAYS} 天关注阈值，请在今日 18:00 前确认是否需要回收、关闭或推进结论。",
+        "",
+        f"实验 ID：{row.get('id') or ''}",
+        f"实验名称：{row.get('name') or ''}",
+        f"创建时间：{row.get('created_time') or created_at.strftime('%Y-%m-%d %H:%M')}",
+        f"当前状态：{row.get('status') or '进行中'}",
+        f"实验标签：{row.get('reversal_label') or '普通实验'}",
+    ]
+    if owners:
+        parts.append(f"负责人：{', '.join(str(owner) for owner in owners[:8])}")
+    if row.get("url"):
+        parts.append(f"链接：{row['url']}")
+    return "\n".join(parts)
+
+
+def create_libra_recycle_task(conn: sqlite3.Connection, row: dict, created_at: datetime, age_days: int, source_id: str, due_at: str) -> dict:
+    title = libra_recycle_title(row)
+    description = libra_recycle_description(row, created_at, age_days)
+    event_id = create_source_event(
+        conn,
+        "libra_experiment_recycle",
+        title,
+        description,
+        source_url=str(row.get("url") or ""),
+        source_id=source_id,
+        metadata={
+            "origin": "libra_recycle_guard",
+            "experiment_id": row.get("id") or "",
+            "experiment_name": row.get("name") or "",
+            "created_time": row.get("created_time") or "",
+            "age_days": age_days,
+            "threshold_days": LIBRA_RECYCLE_THRESHOLD_DAYS,
+            "status": row.get("status") or "",
+            "status_code": row.get("status_code"),
+            "is_reversal": bool(row.get("is_reversal")),
+            "reversal_label": row.get("reversal_label") or "",
+            "due_at": due_at,
+            "visibility": "internal",
+            "storage_target": "local_state",
+        },
+    )
+    now = now_iso()
+    settings = get_settings(conn)
+    task_id = new_id("task")
+    conn.execute(
+        """
+        INSERT INTO tasks (
+          id, title, description, status, priority, due_at, project_id,
+          assignee, source_event_id, source_title, reminder_snoozed_until,
+          completed_at, completion_note, memory_note_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, '待办', 'high', ?, 'Libra 实验回收', ?, ?, ?, '', '', '', '', ?, ?)
+        """,
+        (
+            task_id,
+            title,
+            description,
+            due_at,
+            workspace_account_author(settings, "me"),
+            event_id,
+            title,
+            now,
+            now,
+        ),
+    )
+    audit(
+        conn,
+        "create_libra_recycle_task",
+        "task",
+        task_id,
+        {
+            "source_id": source_id,
+            "experiment_id": row.get("id") or "",
+            "due_at": due_at,
+            "age_days": age_days,
+        },
+    )
+    return {"id": task_id, "source_event_id": event_id, "experiment_id": row.get("id") or ""}
+
+
+def materialize_libra_recycle_todos(conn: sqlite3.Connection, experiments: list[dict]) -> dict:
+    date_key = today_key()
+    due_at = today_18_deadline()
+    now = datetime.now()
+    created: list[dict] = []
+    skipped = {
+        "not_running": 0,
+        "reversal": 0,
+        "missing_created_time": 0,
+        "below_threshold": 0,
+        "duplicate_today": 0,
+    }
+    eligible = 0
+    for row in experiments:
+        if not libra_running(row):
+            skipped["not_running"] += 1
+            continue
+        if libra_reversal(row):
+            skipped["reversal"] += 1
+            continue
+        experiment_id = row.get("id")
+        created_at = parse_libra_datetime(row.get("created_time") or row.get("start_time"))
+        if not experiment_id or not created_at:
+            skipped["missing_created_time"] += 1
+            continue
+        age_delta = now - created_at
+        if age_delta <= timedelta(days=LIBRA_RECYCLE_THRESHOLD_DAYS):
+            skipped["below_threshold"] += 1
+            continue
+        eligible += 1
+        source_id = libra_recycle_source_id(experiment_id, date_key)
+        if existing_source_id(conn, "libra_experiment_recycle", source_id):
+            skipped["duplicate_today"] += 1
+            continue
+        created.append(create_libra_recycle_task(conn, row, created_at, age_delta.days, source_id, due_at))
+    return {
+        "threshold_days": LIBRA_RECYCLE_THRESHOLD_DAYS,
+        "due_at": due_at,
+        "eligible": eligible,
+        "created": len(created),
+        "created_tasks": created,
+        "skipped": skipped,
+    }
+
+
+def run_libra_browser_fetch(app_id: str, owner_type: str, page: int, page_size: int, limit: int, visible: bool = False) -> dict:
+    if not LIBRA_CONNECTOR_SCRIPT.exists():
+        return {
+            "ok": False,
+            "error": "Libra connector script not found",
+            "experiments": [],
+            "updated_at": now_iso(),
+        }
+    command = [
+        "node",
+        str(LIBRA_CONNECTOR_SCRIPT),
+        "--json",
+        "--running-only",
+        "--app-id",
+        app_id,
+        "--owner-type",
+        owner_type,
+        "--page",
+        str(page),
+        "--page-size",
+        str(page_size),
+        "--limit",
+        str(limit),
+    ]
+    if visible:
+        command.append("--visible")
+    started_at = time.time()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=100,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": "Libra browser bridge timed out",
+            "experiments": [],
+            "updated_at": now_iso(),
+        }
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "error": compact_subprocess_text(completed.stderr) or compact_subprocess_text(completed.stdout) or "Libra browser bridge failed",
+            "experiments": [],
+            "updated_at": now_iso(),
+        }
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "error": "Libra browser bridge returned invalid JSON",
+            "experiments": [],
+            "updated_at": now_iso(),
+        }
+    rows = [normalize_libra_row(row) for row in payload.get("rows", []) if isinstance(row, dict)]
+    rows = [row for row in rows if libra_running(row)]
+    return {
+        "ok": True,
+        "route": payload.get("route") or "chrome-profile-browser-bridge",
+        "visible": bool(payload.get("visible")),
+        "updated_at": now_iso(),
+        "duration_ms": int((time.time() - started_at) * 1000),
+        "source_count": payload.get("count", len(rows)),
+        "count": len(rows),
+        "experiments": rows,
+    }
+
+
+def libra_experiments_payload(raw_query: str) -> dict:
+    query = parse_qs(raw_query)
+    app_id = query_value(query, "app_id", "-1")
+    owner_type = query_value(query, "owner_type", "my")
+    page = clamp_int(query_value(query, "page", "1"), 1, 1, 100)
+    page_size = clamp_int(query_value(query, "page_size", "50"), 50, 1, 100)
+    limit = clamp_int(query_value(query, "limit", "50"), 50, 1, 100)
+    refresh = truthy(query_value(query, "refresh", "false"))
+    visible = truthy(query_value(query, "visible", "false"))
+    cache_key = libra_cache_key(app_id, owner_type, page, page_size, limit, visible)
+    cached = LIBRA_EXPERIMENT_CACHE.get(cache_key)
+    if cached and not refresh and time.time() - float(cached.get("cached_at", 0)) < LIBRA_CACHE_TTL_SECONDS:
+        payload = dict(cached["payload"])
+        payload["cached"] = True
+        return payload
+    payload = run_libra_browser_fetch(app_id, owner_type, page, page_size, limit, visible=visible)
+    payload.update(
+        {
+            "cached": False,
+            "cache_ttl_seconds": LIBRA_CACHE_TTL_SECONDS,
+            "owner_type": owner_type,
+            "app_id": app_id,
+            "page": page,
+            "page_size": page_size,
+            "visible": visible,
+        }
+    )
+    if payload.get("ok"):
+        with db_connect() as conn:
+            payload["recycle_todos"] = materialize_libra_recycle_todos(conn, payload.get("experiments") or [])
+            conn.commit()
+        LIBRA_EXPERIMENT_CACHE[cache_key] = {"cached_at": time.time(), "payload": payload}
+    return payload
 
 
 def local_date_key(days_offset: int = 0) -> str:
@@ -4955,7 +5304,15 @@ def state_payload(conn: sqlite3.Connection) -> dict:
     ]
     tasks = [
         row_to_dict(row)
-        for row in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 300").fetchall()
+        for row in conn.execute(
+            """
+            SELECT tasks.*, source_events.source_url AS source_url, source_events.source_type AS source_type
+            FROM tasks
+            LEFT JOIN source_events ON source_events.id = tasks.source_event_id
+            ORDER BY tasks.updated_at DESC
+            LIMIT 300
+            """
+        ).fetchall()
     ]
     notes = [
         row_to_dict(row)
@@ -5063,6 +5420,9 @@ class AgentHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/connectors/lark/status":
             with db_connect() as conn:
                 self.send_json(lark_connector_status(conn))
+            return
+        if parsed.path == "/api/connectors/libra/experiments":
+            self.send_json(libra_experiments_payload(parsed.query))
             return
         if parsed.path == "/api/state":
             with db_connect() as conn:

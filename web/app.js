@@ -854,6 +854,12 @@ function taskDescription(task) {
   return task.description || task.source_title || "仅做本地输入";
 }
 
+function taskSourceUrl(task) {
+  if (task.source_url) return task.source_url;
+  const match = String(task.description || "").match(/链接：\s*(https?:\/\/\S+)/);
+  return match ? match[1] : "";
+}
+
 function renderTodoQuadrants() {
   const quadrants = getTodoQuadrants();
   const grouped = { high: [], focus: [], ops: [], low: [] };
@@ -863,7 +869,7 @@ function renderTodoQuadrants() {
       <div class="todo-matrix-header">
         <div class="card-title">
           <h3>今日 TODO（四象限）</h3>
-          <span>点击卡片即可勾选完成，支持本地记忆</span>
+          <span>点击卡片可跳转来源，勾选圆圈标记完成，支持本地记忆</span>
         </div>
         <span class="todo-matrix-badge"><span class="badge-check">✓</span>Priority Matrix</span>
       </div>
@@ -1160,7 +1166,11 @@ function renderTodoCompact(task) {
   const memoryOpen = state.taskMemoryId === task.id;
   const completed = task.status === "已完成";
   const editing = state.taskEditId === task.id;
-  const cardActionAttrs = completed || memoryOpen ? "" : `data-action="complete-task" data-id="${escapeHtml(task.id)}"`;
+  const sourceUrl = taskSourceUrl(task);
+  const cardActionAttrs = sourceUrl && !memoryOpen
+    ? `data-action="open-task-source" data-url="${escapeHtml(sourceUrl)}"`
+    : "";
+  const checkActionAttrs = completed ? "" : `data-action="complete-task" data-id="${escapeHtml(task.id)}"`;
   if (editing) {
     return `
       <article class="todo-card editing" data-task-row="${escapeHtml(task.id)}">
@@ -1180,8 +1190,8 @@ function renderTodoCompact(task) {
     `;
   }
   return `
-    <article class="todo-card ${completed ? "completed" : ""}" data-task-row="${escapeHtml(task.id)}" ${cardActionAttrs}>
-      <label class="task-check" title="标记完成">
+    <article class="todo-card ${completed ? "completed" : ""} ${sourceUrl ? "has-source" : "no-source"}" data-task-row="${escapeHtml(task.id)}" ${cardActionAttrs}>
+      <label class="task-check" title="标记完成" ${checkActionAttrs}>
         <input type="checkbox" data-action="complete-task" data-id="${escapeHtml(task.id)}" ${completed ? "checked disabled" : ""} />
         <span></span>
       </label>
@@ -2688,7 +2698,13 @@ document.addEventListener("click", async (event) => {
       await refresh("已忽略");
       return;
     }
+    if (action === "open-task-source") {
+      const url = actionButton.dataset.url || "";
+      if (url) window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
     if (action === "complete-task") {
+      event.preventDefault();
       await api(`/api/tasks/${encodeURIComponent(id)}/complete`, {
         method: "POST",
         body: "{}",

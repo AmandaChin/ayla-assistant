@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ayla Meego Todo List",
+  "type": "object",
+  "required": ["route", "code", "count", "rows"],
+  "properties": {
+    "route": {
+      "type": "string",
+      "description": "Connector route used to fetch the data."
+    },
+    "visible": {
+      "type": "boolean",
+      "description": "Whether the browser window was shown for manual SSO/debugging."
+    },
+    "code": {
+      "type": "integer",
+      "description": "Connector status code. 200 means the page bridge returned rows."
+    },
+    "message": {
+      "type": "string"
+    },
+    "count": {
+      "type": "integer",
+      "description": "Number of rows returned after local normalization and limit."
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "status"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_simple_name": {
+            "type": "string"
+          },
+          "work_item_type": {
+            "type": "string"
+          },
+          "current_node": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "due_at": {
+            "type": "string"
+          },
+          "overdue": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

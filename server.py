@@ -135,7 +135,7 @@ CONNECTORS = [
     {"name": "妙记", "priority": "P1", "mode": "会议 TODO 抽取", "status": "lark-cli 只读同步"},
     {"name": "日历", "priority": "P1", "mode": "计划辅助", "status": "lark-cli 只读同步"},
     {"name": "Libra", "priority": "P2", "mode": "实验状态管理", "status": "浏览器桥接只读列表"},
-    {"name": "Meego", "priority": "P2", "mode": "需求节点留盘", "status": "待接入"},
+    {"name": "Meego", "priority": "P2", "mode": "需求节点留盘", "status": "仅保留手动调研 Skill"},
     {"name": "GitHub", "priority": "P3", "mode": "PR 与公开发布", "status": "仅读配置"},
     {"name": "Obsidian", "priority": "P0", "mode": "公开知识 Vault", "status": "本地 Markdown"},
 ]
@@ -4367,7 +4367,15 @@ def state_payload(conn: sqlite3.Connection) -> dict:
     ]
     tasks = [
         row_to_dict(row)
-        for row in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 300").fetchall()
+        for row in conn.execute(
+            """
+            SELECT tasks.*, source_events.source_url AS source_url, source_events.source_type AS source_type
+            FROM tasks
+            LEFT JOIN source_events ON source_events.id = tasks.source_event_id
+            ORDER BY tasks.updated_at DESC
+            LIMIT 300
+            """
+        ).fetchall()
     ]
     notes = [
         row_to_dict(row)

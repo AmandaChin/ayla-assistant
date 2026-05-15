@@ -13,8 +13,10 @@
 - 快速备忘自动分类为 TODO、知识笔记或普通备忘。
 - 快速备忘包含飞书文档或网页链接时，会优先用 `lark-cli docs +fetch --api-version v2` 读取飞书正文，普通网页回退到本地网页解析；工作台展示简短链接总结，真正落库的 Study / 知识资产会把抓取到的正文转换成完整 Markdown，并保留 `source_url`。
 - Agent 编排视图，展示 Collector / Orchestrator / Task Extractor / Review / Knowledge Curator 等角色、连接器优先级、待确认动作和最近 AgentRun。
-- `/api/agent/ingest` 支持文档设计里的多候选 `candidates` Schema，可一次写入 TODO、公开知识、工作沉淀、固定便笺和总结素材候选。
+- `/api/agent/ingest` 支持文档设计里的多候选 `candidates` Schema，可一次写入 TODO、Agent 记忆、公开知识、工作沉淀、固定便笺和总结素材候选。
 - 新增 `agent_runs` 和 `confirmations` 审计表，低风险本地写入走日维度批量确认，TODO、外部写入、高风险动作进入即时或二次确认。
+- 新增独立 `AgentMemory` 本地持久层，固定便笺只给人看；AI 读的长期偏好、规则、项目上下文和工具用法通过 `memory_candidate` 确认后写入 AgentMemory。
+- 新增 `knowledge_spaces` / `knowledge_categories`，按 work、coding、research、personal、public 分场景管理知识库分类存储。
 - 公开知识与内部工作资料分流：公开、可迁移内容写 `PublicKnowledgeVault`；工作沉淀、会议、实验、TODO 和内部资料默认写 `LocalWorkState`。
 - 今日增量整理，可先编辑标题、内容、目标分类、项目、截止时间等，再按天批量确认自动分类结果。
 - 每日备忘归档会把归档摘要写成本地 Markdown 资产，并用本机模型 CLI 生成一句话标题；今日看板卡片可直接跳转到对应资产。
@@ -31,17 +33,102 @@
 - 基于笔记、标签、项目和 TODO 的轻量图谱。
 - 设置中心和审计日志。
 
-## 启动
+## Mac App 与 CLI
+
+```bash
+./ayla install --force
+```
+
+安装后会生成：
+
+```text
+~/Applications/Ayla.app
+~/.local/bin/ayla
+~/Library/Application Support/Ayla/
+```
+
+如果 `~/.local/bin` 已在 `PATH` 中，后续可以直接执行：
+
+```bash
+ayla open
+ayla status
+ayla doctor
+ayla update
+ayla capture "记一下今天要跟进项目排期"
+ayla sync lark --days 7
+```
+
+如果 `ayla` 还不在 `PATH`，先用完整路径执行：
+
+```bash
+~/.local/bin/ayla status
+```
+
+`Ayla.app` 是无第三方依赖的轻量原生 macOS 客户端：使用 Swift + AppKit + WebKit `WKWebView` 构建窗口。点击或执行 `ayla open` 后，App 会自动拉起 Ayla Core，选择一个可用的本地端口，写入运行状态文件，并在 App 窗口内展示工作台。用户不再需要记住或维护固定的 `5173` 端口，也不会再跳到外部浏览器。
+
+运行状态和日志位于：
+
+```text
+~/Library/Application Support/Ayla/
+  app/                  # 已安装的 Ayla Core 和 Web 资源
+  data/                 # SQLite、LocalWorkState、PublicKnowledgeVault
+  logs/core.log         # 后台 Core 日志
+  runtime/core-state.json
+  install.json
+```
+
+App 构建链路位于：
+
+```text
+macos/AylaClient/main.swift        # 原生 AppKit/WKWebView 客户端
+macos/AylaClient/AppIcon.png       # Ayla App 图标源文件
+scripts/build_macos_client.sh      # swiftc 构建 .app bundle
+scripts/generate_app_icon.py       # 无第三方依赖的图标生成脚本
+packaging/macos/app_launcher.py    # App 内部用于启动 Ayla Core 的 Python bootstrap
+```
+
+构建脚本会把 `macos/AylaClient/AppIcon.png` 转成 `Ayla.app/Contents/Resources/AylaAppIcon.icns`，并写入 `CFBundleIconFile`。如果图标源文件不存在，构建时会自动调用 `scripts/generate_app_icon.py` 重新生成。
+
+## 后续更新
+
+本地仓库有功能改动后，推荐直接从当前仓库重装一次：
+
+```bash
+git pull --ff-only origin master
+./ayla install --force
+ayla stop
+ayla open
+```
+
+如果已经通过 `./ayla install --force` 安装过，且 `~/.local/bin` 在 `PATH` 中，也可以用已安装的 CLI 更新：
+
+```bash
+ayla update
+ayla stop
+ayla open
+```
+
+`ayla update` 会读取 `~/Library/Application Support/Ayla/install.json` 里记录的 `source_root`，从该源码目录重新复制 Ayla Core、Web 资源、Swift 客户端和构建脚本，并重新构建 `~/Applications/Ayla.app`。个人数据不会被覆盖，仍保留在：
+
+```text
+~/Library/Application Support/Ayla/data/
+```
+
+更新规则：
+
+- 改 `web/`、`server.py`、`agents/`、`packaging/` 或 CLI 逻辑：执行 `ayla update` 或 `./ayla install --force`，再重启 App。
+- 改 `macos/AylaClient/main.swift`、`scripts/build_macos_client.sh` 或 App 图标：同样执行 `ayla update` 或 `./ayla install --force`，因为需要重新构建 `.app`。
+- 如果后续改到 SQLite 表结构，需要补迁移脚本；当前安装更新只负责替换程序文件，不会删除用户数据。
+
+## 开发模式
+
+开发时仍然可以直接启动当前仓库里的 Web MVP：
 
 ```bash
 python3 server.py --host 127.0.0.1 --port 5173
 ```
 
-打开：
-
-```text
-http://127.0.0.1:5173
-```
+开发模式会继续使用仓库内的 `agent-vault/`。Mac App 模式会通过 `AYLA_HOME` 把个人数据写到 `~/Library/Application Support/Ayla/data/`。
 
 ## 本地数据
 
@@ -51,10 +138,16 @@ http://127.0.0.1:5173
 /Users/bytedance/Documents/ayla assistant/agent-vault/
 ```
 
-也可以通过 `AYLA_PROJECT_ROOT` 或 `AYLA_VAULT_ROOT` 覆盖资产位置。
+开发态也可以通过 `AYLA_PROJECT_ROOT`、`AYLA_VAULT_ROOT` 覆盖资产位置。Mac App 模式会通过 `AYLA_HOME` 把个人数据写到 `~/Library/Application Support/Ayla/data/`。
 
 ```text
 agent-vault/
+  AgentMemory/
+    global/
+    projects/
+    tools/
+    skills/
+    episodes/
   LocalWorkState/
     inbox/
     tasks/
@@ -79,7 +172,7 @@ agent-vault/
     database.sqlite
 ```
 
-其中 `/agent-vault/` 已写入 `.gitignore`，用于存放个人数据、SQLite 数据库和生成的 Markdown 笔记，不上传到 GitHub。
+其中 `agent-vault/` 已写入 `.gitignore`，用于存放开发态个人数据、SQLite 数据库和生成的 Markdown 笔记，不上传到 GitHub。正式 Mac App 安装后的数据默认不写入仓库，而是写入 `~/Library/Application Support/Ayla/data/`。
 
 ## MVP 流程
 
@@ -89,6 +182,7 @@ agent-vault/
 → model_cli / 外部 Agent 生成结构化 candidates
 → 按风险进入批量确认 / 即时确认 / 二次确认
 → 每天批量确认增量分类
+→ memory_candidate 写 AgentMemory，knowledge_candidate 写分场景知识库
 → TODO 进入 TODO 中心，本地工作记录写 LocalWorkState
 → 公开知识写 PublicKnowledgeVault
 → 审计日志记录操作
@@ -171,7 +265,7 @@ POST /api/connectors/lark/bind/claim
 
 ## 后续开发方向
 
-- 替换为 Tauri + React + TypeScript 桌面端。
+- 将当前 AppKit/WKWebView 客户端继续增强为菜单栏、全局快捷键、通知和登录项完整体验，CLI 命令和本地数据目录保持兼容。
 - 将当前 SQLite 表结构固化为迁移脚本。
 - 增加真实飞书群聊采集、摘要和 TODO 抽取。
 - 将当前本地网页解析器替换或增强为 MCP 文档解析器和真实 AI 摘要模型。

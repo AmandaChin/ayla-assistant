@@ -20,7 +20,7 @@
     },
     "intent": {
       "type": "string",
-      "enum": ["capture", "task", "public_knowledge", "work_record", "query", "summary", "external_action"]
+      "enum": ["capture", "task", "public_knowledge", "work_record", "memory", "knowledge", "query", "summary", "external_action"]
     },
     "summary": {
       "type": "string",
@@ -75,7 +75,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["todo", "public_note", "work_record", "report_material", "pinned", "memo"]
+          "enum": ["todo", "public_note", "work_record", "report_material", "knowledge_candidate", "memory_candidate", "pinned", "memo"]
         },
         "title": {
           "type": "string",
@@ -126,6 +126,30 @@
           "enum": ["low", "normal", "medium", "high", "urgent"]
         },
         "project": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string",
+          "enum": ["global", "coding", "work", "research", "writing", "planning", "daily", "personal", "public"]
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["global", "project", "repo", "tool", "skill", "person", "episode"]
+        },
+        "memory_type": {
+          "type": "string",
+          "enum": ["preference", "rule", "project_context", "workflow", "tool_usage", "decision", "user_profile", "writing_style"]
+        },
+        "key": {
+          "type": "string"
+        },
+        "normalized_key": {
+          "type": "string"
+        },
+        "knowledge_space": {
+          "type": "string"
+        },
+        "knowledge_category": {
           "type": "string"
         },
         "source_url": {

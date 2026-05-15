@@ -4,11 +4,20 @@
 
 ## 1. 工作台地址
 
-本机运行：
+Mac App 模式下不要写死端口。先打开 Ayla：
+
+```bash
+ayla open --wait
+ayla status
+```
+
+`ayla status` 会返回当前 `core.url`。同一台 Mac 上的 Agent 也可以直接读取：
 
 ```text
-http://127.0.0.1:5173
+~/Library/Application Support/Ayla/runtime/core-state.json
 ```
+
+开发模式才固定使用 `http://127.0.0.1:5173`。
 
 写入接口需要 Token。Token 可在工作台「设置中心 → OpenClaw 写入 Token」复制。
 
@@ -19,7 +28,7 @@ OpenClaw Agent 在整理前先拉取本地上下文：
 ```bash
 curl -L -sS \
   -H "X-Ayla-Agent-Token: $AYLA_AGENT_TOKEN" \
-  http://127.0.0.1:5173/api/agent/context
+  "$AYLA_BASE_URL/api/agent/context"
 ```
 
 返回内容包含：
@@ -38,7 +47,7 @@ OpenClaw Agent 整理完成后调用：
 
 ```bash
 curl -L -sS \
-  -X POST http://127.0.0.1:5173/api/agent/ingest \
+  -X POST "$AYLA_BASE_URL/api/agent/ingest" \
   -H "Content-Type: application/json" \
   -H "X-Ayla-Agent-Token: $AYLA_AGENT_TOKEN" \
   -d '{
@@ -89,8 +98,19 @@ todo            -> TODO 候选，默认 local_state，通常即时确认
 public_note     -> 公开知识候选，写 PublicKnowledgeVault，必须 visibility=public
 work_record     -> 工作沉淀候选，写 LocalWorkState，不进入公开 Vault
 report_material -> 周报/月报/季度总结素材，写 LocalWorkState/reports
-pinned          -> 固定便笺候选
+memory_candidate -> AI 读的长期记忆候选，确认后写 AgentMemory
+knowledge_candidate -> 分场景知识库候选，确认后写 KnowledgeBase/Markdown
+pinned          -> 人看的固定便笺候选，只属于工作台可视化区，不进入 Agent context
 memo            -> 普通备忘归档候选
+```
+
+`memory_candidate` 建议额外带上：
+
+```text
+memory_type     -> preference / rule / project_context / workflow / tool_usage / decision / user_profile / writing_style
+scenario        -> global / coding / work / research / writing / planning / daily
+scope           -> global / project / repo / tool / skill / person
+key             -> 稳定去重键，例如 ayla.memory.boundary
 ```
 
 `storage_target` 取值：
@@ -113,7 +133,7 @@ public
 
 ```text
 batch_confirm   -> 低风险本地写入，进入今日增量整理
-instant_confirm -> TODO、DDL、飞书文档写入、外部工具动作
+instant_confirm -> TODO、DDL、AgentMemory、飞书文档写入、外部工具动作
 double_confirm  -> 删除、覆盖、公开发布和 high risk
 ```
 
@@ -145,7 +165,7 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py validate --payload /path
 ```bash
 python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
   --payload /path/to/model-output.json \
-  --base-url http://127.0.0.1:5173 \
+  --base-url "$AYLA_BASE_URL" \
   --token "$AYLA_AGENT_TOKEN" \
   --dry-run
 ```
@@ -164,9 +184,11 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 5. 每个 candidate 必须包含 type、title、content、storage_target、visibility、tags、source_refs、risk_level、requires_confirmation。
 6. 公司内部资料、会议纪要、实验状态、Meego/Libra/GitHub 工作状态默认 visibility=internal，storage_target=local_state 或 feishu_doc，不写 obsidian_public_vault。
 7. 只有可公开、可迁移、适合系统学习的内容才允许 type=public_note，visibility=public，storage_target=obsidian_public_vault。
-8. 调用 ayla workspace ingest 写入本机工作台。
-9. 默认 requires_confirmation=true，除非用户明确要求直接保存且风险为 low。
-10. 回复用户一句简短确认：已放入待确认队列，并说明归类结果。
+8. 稳定偏好、规则、项目上下文、工具用法才生成 memory_candidate，并补 memory_type、scenario、scope、key。
+9. 固定便笺只给人看，不作为 Agent 记忆；需要 AI 读取的长期上下文必须走 memory_candidate。
+10. 调用 ayla workspace ingest 写入本机工作台。
+11. 默认 requires_confirmation=true，除非用户明确要求直接保存且风险为 low。
+12. 回复用户一句简短确认：已放入待确认队列，并说明归类结果。
 ```
 
 ## 7. MVP 部署建议
@@ -176,7 +198,7 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 ```text
 飞书 Bot
 → 本机 OpenClaw Agent
-→ http://127.0.0.1:5173/api/agent/ingest
+→ Ayla Core 当前 core.url /api/agent/ingest
 → Ayla 工作台今日增量整理
 ```
 

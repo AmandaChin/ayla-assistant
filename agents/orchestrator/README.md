@@ -52,7 +52,14 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py validate --payload /path
 
 ## 提交到正在运行的 Ayla 工作台
 
-先启动 Ayla：
+Mac App 模式下先启动 Ayla，并从 `ayla status` 的 `core.url` 获取当前地址：
+
+```bash
+ayla open --wait
+ayla status
+```
+
+开发模式也可以继续手动启动固定端口：
 
 ```bash
 python3 server.py --host 127.0.0.1 --port 5173
@@ -63,7 +70,7 @@ python3 server.py --host 127.0.0.1 --port 5173
 ```bash
 AYLA_AGENT_TOKEN="..." python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
   --payload /path/to/model-output.json \
-  --base-url http://127.0.0.1:5173
+  --base-url "$AYLA_BASE_URL"
 ```
 
 成功后会返回 `source_event_id`、`agent_run_id`、`inbox_item_id` 和 `confirmation_id`。
@@ -79,6 +86,13 @@ AYLA_AGENT_TOKEN="..." python3 agents/orchestrator/scripts/orchestrator_cli.py i
 - 可测试：样例 payload 校验和 `check-examples`
 - 与现有后端兼容：输出匹配 `/api/agent/ingest`
 
+当前已经区分人看的工作台和 Agent 读取的本地持久层：
+
+- 固定便笺属于 `HumanWorkspace / pinned_slots`，只给用户看，不注入 `/api/agent/context`。
+- `memory_candidate` 确认后写入 `AgentMemory/` 和 `agent_memories`，用于偏好、规则、项目上下文、工具用法等跨会话上下文。
+- `knowledge_candidate` / `public_note` / `work_record` 写入分场景知识库和 Markdown 资产，长内容只作为索引和引用提供给 Agent。
+- Agent 拉上下文时可使用 `/api/agent/context?scenario=coding&project=ayla` 这样的场景化 context pack。
+
 后续可以继续补真实模型 runner、MCP 包装、Inbox 审核工具和更深的飞书来源解析。
 
 ## 后续 Skill 拆分原则
@@ -93,6 +107,8 @@ ayla-confirmation-policy     推导确认策略
 ayla-quick-memo-organizer    整理一句话快速备忘
 ayla-public-knowledge-router 路由公开知识
 ayla-local-work-router       路由本地工作沉淀
+ayla-agent-memory-curator    提取、合并、过期和确认 AgentMemory
+ayla-knowledge-space-router  按 work/coding/research/personal/public 路由知识库
 ayla-feishu-source-sync      只读同步飞书来源
 ayla-meeting-minutes-parser  解析妙记
 ```

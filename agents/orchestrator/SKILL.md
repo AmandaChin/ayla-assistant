@@ -50,17 +50,17 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py check-examples
 
 ```bash
 AYLA_AGENT_TOKEN="..." python3 agents/orchestrator/scripts/orchestrator_cli.py fetch-context \
-  --base-url http://127.0.0.1:5173
+  --base-url "$AYLA_BASE_URL"
 ```
 
-如果本机 Agent 沙箱拦截 Python 访问 `127.0.0.1`，`fetch-context` 和非 dry-run `ingest` 会在 localhost 场景下回退到本仓库 `server.py` 的本地函数；远端 `base-url` 不会回退。
+Mac App 模式下，先通过 `ayla open --wait` 启动，再从 `ayla status` 的 `core.url` 或 `~/Library/Application Support/Ayla/runtime/core-state.json` 读取 `AYLA_BASE_URL`。如果本机 Agent 沙箱拦截 Python 访问 `127.0.0.1`，`fetch-context` 和非 dry-run `ingest` 会在 localhost 场景下回退到本仓库 `server.py` 的本地函数；远端 `base-url` 不会回退。
 
 写入前 dry-run：
 
 ```bash
 python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
   --payload agents/orchestrator/examples/capture-link-and-todo.output.json \
-  --base-url http://127.0.0.1:5173 \
+  --base-url "$AYLA_BASE_URL" \
   --token "$AYLA_AGENT_TOKEN" \
   --dry-run
 ```
@@ -70,7 +70,7 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 ```bash
 python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
   --payload /path/to/model-output.json \
-  --base-url http://127.0.0.1:5173 \
+  --base-url "$AYLA_BASE_URL" \
   --token "$AYLA_AGENT_TOKEN"
 ```
 
@@ -82,13 +82,17 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 | `public_note` | 公开、可迁移的知识或待读资料 | `obsidian_public_vault` | `public` |
 | `work_record` | 内部工作上下文、项目事实、实验状态 | `local_state` | `internal` |
 | `report_material` | 日报、周报、月报、OKR、复盘素材 | `local_state` | `internal` |
-| `pinned` | 长期稳定信息、常用命令、固定资料 | `local_state` | `private` 或 `internal` |
+| `memory_candidate` | AI 需要跨会话读取的偏好、规则、项目上下文、工具用法 | `local_state` | `private` 或 `internal` |
+| `knowledge_candidate` | 分场景知识库资料，长内容只按需检索 | `local_state` 或 `obsidian_public_vault` | `private` / `internal` / `public` |
+| `pinned` | 人看的固定便笺，只进入工作台可视化区 | `local_state` | `private` 或 `internal` |
 | `memo` | 暂不确定的普通备忘，先留在 Inbox | `local_state` | `private` 或 `internal` |
+
+`memory_candidate` 必须尽量补齐 `memory_type`、`scenario`、`scope` 和稳定 `key`，例如 `ayla.memory.boundary`。固定便笺不参与 Agent context；需要 AI 读取的长期上下文必须写成 `memory_candidate`。
 
 ## 确认策略
 
 - 默认 `requires_confirmation=true`。
-- `todo`、`due_at`、外部动作、飞书文档写入、中风险内容需要即时确认。
+- `todo`、`due_at`、`memory_candidate`、外部动作、飞书文档写入、中风险内容需要即时确认。
 - 删除、覆盖、公开发布、高风险内容需要二次确认。
 - 低风险本地记录可以进入批量确认。
 - 内部资料不要路由到 `obsidian_public_vault`。

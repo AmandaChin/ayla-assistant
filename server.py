@@ -42,9 +42,16 @@ def configured_root(env_key: str, fallback: Path) -> Path:
 
 
 PROJECT_ROOT = configured_root("AYLA_PROJECT_ROOT", default_project_root())
-VAULT_ROOT = configured_root("AYLA_VAULT_ROOT", PROJECT_ROOT / "agent-vault")
+VAULT_ROOT = configured_root(
+    "AYLA_HOME",
+    configured_root(
+        "AYLA_DATA_DIR",
+        configured_root("AYLA_VAULT_ROOT", PROJECT_ROOT / "agent-vault"),
+    ),
+)
 LOCAL_STATE_ROOT = VAULT_ROOT / "LocalWorkState"
 PUBLIC_VAULT_ROOT = VAULT_ROOT / "PublicKnowledgeVault"
+AGENT_MEMORY_ROOT = VAULT_ROOT / "AgentMemory"
 RUNTIME_ROOT = VAULT_ROOT / "runtime"
 DB_PATH = VAULT_ROOT / "system" / "database.sqlite"
 LIBRA_CONNECTOR_SCRIPT = ROOT / "agents" / "libra-connector" / "scripts" / "libra_browser_fetch.mjs"
@@ -100,6 +107,8 @@ DEFAULT_SETTINGS = {
     "workspace_account_auth_status": "demo",
     "github_repo": "",
     "agent_api_token": "",
+    "last_daily_rollover_date": "",
+    "last_daily_rollover_at": "",
 }
 
 PUBLIC_CATEGORY_DIRS = {
@@ -130,6 +139,86 @@ LOCAL_STATE_CATEGORY_DIRS = {
 }
 
 CATEGORY_DIRS = PUBLIC_CATEGORY_DIRS
+
+DEFAULT_KNOWLEDGE_SPACES = [
+    {
+        "id": "space_work",
+        "slug": "work",
+        "name": "工作沉淀",
+        "scenario": "work",
+        "storage_target": "local_state",
+        "root_path": str(LOCAL_STATE_ROOT / "work_records"),
+        "visibility": "internal",
+        "sort_order": 0,
+        "categories": [
+            ("cat_work_project_context", "项目上下文", "project_context", "project_notes", "internal", 0),
+            ("cat_work_meetings", "会议纪要", "meetings", "meeting_actions", "internal", 1),
+            ("cat_work_reports", "周报月报", "reports", "reports", "internal", 2),
+            ("cat_work_experiments", "实验状态", "experiments", "experiment_snapshots", "internal", 3),
+        ],
+    },
+    {
+        "id": "space_coding",
+        "slug": "coding",
+        "name": "编码知识",
+        "scenario": "coding",
+        "storage_target": "local_state",
+        "root_path": str(LOCAL_STATE_ROOT / "work_records"),
+        "visibility": "internal",
+        "sort_order": 1,
+        "categories": [
+            ("cat_coding_repo", "Repo 结构", "repo", "coding/repo", "internal", 0),
+            ("cat_coding_commands", "构建与命令", "commands", "coding/commands", "internal", 1),
+            ("cat_coding_review", "代码规范", "review", "coding/review", "internal", 2),
+            ("cat_coding_errors", "常见错误", "errors", "coding/errors", "internal", 3),
+        ],
+    },
+    {
+        "id": "space_research",
+        "slug": "research",
+        "name": "研究资料",
+        "scenario": "research",
+        "storage_target": "local_state",
+        "root_path": str(LOCAL_STATE_ROOT / "work_records"),
+        "visibility": "private",
+        "sort_order": 2,
+        "categories": [
+            ("cat_research_articles", "文章论文", "articles", "research/articles", "private", 0),
+            ("cat_research_concepts", "概念方法", "concepts", "research/concepts", "private", 1),
+            ("cat_research_tools", "工具调研", "tools", "research/tools", "private", 2),
+        ],
+    },
+    {
+        "id": "space_personal",
+        "slug": "personal",
+        "name": "个人长期资料",
+        "scenario": "personal",
+        "storage_target": "local_state",
+        "root_path": str(LOCAL_STATE_ROOT / "personal_memos"),
+        "visibility": "private",
+        "sort_order": 3,
+        "categories": [
+            ("cat_personal_goals", "目标偏好", "goals", "personal/goals", "private", 0),
+            ("cat_personal_templates", "常用模板", "templates", "personal/templates", "private", 1),
+        ],
+    },
+    {
+        "id": "space_public",
+        "slug": "public",
+        "name": "公开知识",
+        "scenario": "public",
+        "storage_target": "obsidian_public_vault",
+        "root_path": str(PUBLIC_VAULT_ROOT),
+        "visibility": "public",
+        "sort_order": 4,
+        "categories": [
+            ("cat_public_concepts", "概念", "concepts", "10_Concepts", "public", 0),
+            ("cat_public_resources", "资料", "resources", "20_Resources", "public", 1),
+            ("cat_public_methods", "方法论", "methods", "30_Methods", "public", 2),
+            ("cat_public_tools", "工具", "tools", "40_Tools", "public", 3),
+        ],
+    },
+]
 
 AGENT_ROLES = [
     {
@@ -231,6 +320,13 @@ def today_key() -> str:
     return datetime.now().date().isoformat()
 
 
+def next_daily_refresh_at() -> str:
+    now = datetime.now().astimezone()
+    next_date = now.date() + timedelta(days=1)
+    next_midnight = datetime.combine(next_date, datetime.min.time(), tzinfo=now.tzinfo)
+    return next_midnight.isoformat(timespec="seconds")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
@@ -246,6 +342,11 @@ def ensure_dirs() -> None:
         LOCAL_STATE_ROOT / "audit_log",
         LOCAL_STATE_ROOT / "raw",
         LOCAL_STATE_ROOT / "personal_memos",
+        AGENT_MEMORY_ROOT / "global",
+        AGENT_MEMORY_ROOT / "projects",
+        AGENT_MEMORY_ROOT / "tools",
+        AGENT_MEMORY_ROOT / "skills",
+        AGENT_MEMORY_ROOT / "episodes",
         PUBLIC_VAULT_ROOT / "00_Inbox",
         PUBLIC_VAULT_ROOT / "10_Concepts",
         PUBLIC_VAULT_ROOT / "20_Resources",
@@ -430,6 +531,68 @@ def init_db() -> None:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS agent_memories (
+              id TEXT PRIMARY KEY,
+              memory_type TEXT NOT NULL,
+              scenario TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              key TEXT NOT NULL,
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              normalized_value TEXT NOT NULL DEFAULT '{}',
+              confidence REAL NOT NULL DEFAULT 0.8,
+              status TEXT NOT NULL DEFAULT 'active',
+              sensitivity TEXT NOT NULL DEFAULT 'private',
+              visibility TEXT NOT NULL DEFAULT 'private',
+              source_event_ids TEXT NOT NULL DEFAULT '[]',
+              linked_note_ids TEXT NOT NULL DEFAULT '[]',
+              path TEXT NOT NULL DEFAULT '',
+              version INTEGER NOT NULL DEFAULT 1,
+              last_used_at TEXT,
+              expires_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(key, scenario, scope)
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_spaces (
+              id TEXT PRIMARY KEY,
+              slug TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL,
+              scenario TEXT NOT NULL,
+              storage_target TEXT NOT NULL,
+              root_path TEXT NOT NULL,
+              visibility TEXT NOT NULL,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_categories (
+              id TEXT PRIMARY KEY,
+              space_id TEXT NOT NULL,
+              parent_id TEXT,
+              name TEXT NOT NULL,
+              slug TEXT NOT NULL,
+              path_prefix TEXT NOT NULL,
+              visibility_allowed TEXT NOT NULL,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(space_id, slug),
+              FOREIGN KEY(space_id) REFERENCES knowledge_spaces(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS note_categories (
+              note_id TEXT NOT NULL,
+              category_id TEXT NOT NULL,
+              is_primary INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(note_id, category_id),
+              FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE,
+              FOREIGN KEY(category_id) REFERENCES knowledge_categories(id)
+            );
             """
         )
         ensure_columns(
@@ -473,6 +636,68 @@ def init_db() -> None:
                     """,
                     (new_id("slot"), title, content, category, index, now, now),
                 )
+        seed_knowledge_defaults(conn)
+
+
+def seed_knowledge_defaults(conn: sqlite3.Connection) -> None:
+    now = now_iso()
+    for space in DEFAULT_KNOWLEDGE_SPACES:
+        conn.execute(
+            """
+            INSERT INTO knowledge_spaces (
+              id, slug, name, scenario, storage_target, root_path, visibility,
+              sort_order, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+              name = excluded.name,
+              scenario = excluded.scenario,
+              storage_target = excluded.storage_target,
+              root_path = excluded.root_path,
+              visibility = excluded.visibility,
+              sort_order = excluded.sort_order,
+              updated_at = excluded.updated_at
+            """,
+            (
+                space["id"],
+                space["slug"],
+                space["name"],
+                space["scenario"],
+                space["storage_target"],
+                space["root_path"],
+                space["visibility"],
+                space["sort_order"],
+                now,
+                now,
+            ),
+        )
+        for category_id, name, slug, path_prefix, visibility, sort_order in space["categories"]:
+            conn.execute(
+                """
+                INSERT INTO knowledge_categories (
+                  id, space_id, parent_id, name, slug, path_prefix,
+                  visibility_allowed, sort_order, created_at, updated_at
+                )
+                VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(space_id, slug) DO UPDATE SET
+                  name = excluded.name,
+                  path_prefix = excluded.path_prefix,
+                  visibility_allowed = excluded.visibility_allowed,
+                  sort_order = excluded.sort_order,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    category_id,
+                    space["id"],
+                    name,
+                    slug,
+                    path_prefix,
+                    json.dumps([visibility], ensure_ascii=False),
+                    sort_order,
+                    now,
+                    now,
+                ),
+            )
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -489,6 +714,9 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         "candidate_output",
         "questions",
         "payload",
+        "normalized_value",
+        "linked_note_ids",
+        "visibility_allowed",
     ]:
         if key in data and isinstance(data[key], str):
             try:
@@ -3585,10 +3813,20 @@ def confirm_note(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
             created_at,
         ),
     )
+    linked_category_id = link_note_category(
+        conn,
+        note_id,
+        category,
+        storage_target,
+        visibility,
+        str(payload.get("category_id") or metadata.get("knowledge_category_id") or ""),
+    )
     metadata["materialized_note_id"] = note_id
     metadata["materialized_path"] = str(path)
     metadata["materialized_at"] = created_at
     metadata["asset_url"] = f"/api/notes/{note_id}/raw"
+    if linked_category_id:
+        metadata["knowledge_category_id"] = linked_category_id
     if source_url:
         metadata["source_url"] = source_url
     if link_enrichment:
@@ -3841,6 +4079,41 @@ def materialize_ai_summary_defaults(conn: sqlite3.Connection) -> dict:
             result["note"] += 1
     if result["todo"] or result["note"]:
         audit(conn, "materialize_ai_summary_defaults", "daily_ai_summary", today_key(), result)
+    return result
+
+
+def ensure_daily_rollover(conn: sqlite3.Connection) -> dict:
+    today = today_key()
+    settings = get_settings(conn)
+    last_date = str(settings.get("last_daily_rollover_date") or "").strip()
+    if last_date == today:
+        return {
+            "date": today,
+            "changed": False,
+            "previous_date": last_date,
+            "last_refresh_at": str(settings.get("last_daily_rollover_at") or ""),
+            "next_refresh_at": next_daily_refresh_at(),
+            "materialized_defaults": {"todo": 0, "note": 0, "skipped": 0},
+        }
+    materialized_defaults = materialize_ai_summary_defaults(conn)
+    refreshed_at = now_iso()
+    save_settings_values(
+        conn,
+        {
+            "last_daily_rollover_date": today,
+            "last_daily_rollover_at": refreshed_at,
+        },
+    )
+    result = {
+        "date": today,
+        "changed": True,
+        "previous_date": last_date,
+        "last_refresh_at": refreshed_at,
+        "next_refresh_at": next_daily_refresh_at(),
+        "materialized_defaults": materialized_defaults,
+    }
+    # 自然日切换只标记工作台进入新的一天，具体看板内容仍由当天查询实时生成。
+    audit(conn, "daily_rollover", "daily_workbench", today, result)
     return result
 
 
@@ -4256,6 +4529,320 @@ def delete_pinned_slot(conn: sqlite3.Connection, slot_id: str) -> dict:
     return {"id": slot_id}
 
 
+def normalize_memory_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    aliases = {"pending": "pending_review", "disabled": "archived", "expired": "stale"}
+    status = aliases.get(status, status)
+    return status if status in ["active", "pending_review", "stale", "archived"] else "active"
+
+
+def memory_scope_directory(scope: str, scenario: str, key: str, project: str = "") -> Path:
+    scope_value = str(scope or "global").strip().lower()
+    scenario_value = slugify(str(scenario or "global"))
+    project_hint = project or (key.split(".", 1)[0] if "." in key else "")
+    project_value = slugify(project_hint)
+    if scope_value == "tool":
+        return AGENT_MEMORY_ROOT / "tools"
+    if scope_value == "skill":
+        return AGENT_MEMORY_ROOT / "skills"
+    if scope_value in ["project", "repo"] or project_value:
+        return AGENT_MEMORY_ROOT / "projects" / (project_value or scenario_value or "general")
+    if scope_value == "episode":
+        return AGENT_MEMORY_ROOT / "episodes" / datetime.now().strftime("%Y-%m")
+    return AGENT_MEMORY_ROOT / "global"
+
+
+def agent_memory_markdown(memory: dict) -> str:
+    source_ids = as_string_list(memory.get("source_event_ids"))
+    linked_note_ids = as_string_list(memory.get("linked_note_ids"))
+    return (
+        "---\n"
+        f"id: {yaml_scalar(memory.get('id') or '')}\n"
+        f"title: {yaml_scalar(memory.get('title') or '')}\n"
+        f"memory_type: {yaml_scalar(memory.get('memory_type') or '')}\n"
+        f"scenario: {yaml_scalar(memory.get('scenario') or '')}\n"
+        f"scope: {yaml_scalar(memory.get('scope') or '')}\n"
+        f"key: {yaml_scalar(memory.get('key') or '')}\n"
+        f"status: {yaml_scalar(memory.get('status') or 'active')}\n"
+        f"sensitivity: {yaml_scalar(memory.get('sensitivity') or 'private')}\n"
+        f"visibility: {yaml_scalar(memory.get('visibility') or 'private')}\n"
+        f"confidence: {memory.get('confidence') or 0.8}\n"
+        f"version: {memory.get('version') or 1}\n"
+        f"source_event_ids: {yaml_list(source_ids)}\n"
+        f"linked_note_ids: {yaml_list(linked_note_ids)}\n"
+        f"created_at: {yaml_scalar(memory.get('created_at') or '')}\n"
+        f"updated_at: {yaml_scalar(memory.get('updated_at') or '')}\n"
+        "---\n\n"
+        f"# {memory.get('title') or 'Agent Memory'}\n\n"
+        f"{str(memory.get('content') or '').strip()}\n"
+    )
+
+
+def write_agent_memory_file(memory: dict) -> Path:
+    target_dir = memory_scope_directory(
+        str(memory.get("scope") or "global"),
+        str(memory.get("scenario") or "global"),
+        str(memory.get("key") or ""),
+        str(memory.get("project") or ""),
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = Path(str(memory.get("path") or ""))
+    if not path.is_absolute():
+        path = target_dir / f"{slugify(memory.get('key') or memory.get('title') or memory.get('id') or 'memory')}.md"
+    path.write_text(agent_memory_markdown(memory), encoding="utf-8")
+    return path
+
+
+def create_agent_memory(conn: sqlite3.Connection, payload: dict) -> dict:
+    memory_type = str(payload.get("memory_type") or "preference").strip() or "preference"
+    scenario = str(payload.get("scenario") or "global").strip().lower() or "global"
+    scope = str(payload.get("scope") or "global").strip().lower() or "global"
+    title = str(payload.get("title") or "").strip() or title_from_content(str(payload.get("content") or ""), "Agent Memory")
+    key = str(payload.get("key") or payload.get("normalized_key") or "").strip()
+    if not key:
+        key = ".".join([memory_type, scenario, slugify(title)])
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise ValueError("memory content is required")
+    source_event_ids = as_string_list(payload.get("source_event_ids") or payload.get("source_refs"))
+    linked_note_ids = as_string_list(payload.get("linked_note_ids"))
+    now = now_iso()
+    existing = conn.execute(
+        "SELECT * FROM agent_memories WHERE key = ? AND scenario = ? AND scope = ?",
+        (key, scenario, scope),
+    ).fetchone()
+    memory_id = existing["id"] if existing else new_id("mem")
+    created_at = existing["created_at"] if existing else now
+    version = int(existing["version"] or 1) + 1 if existing else 1
+    memory = {
+        "id": memory_id,
+        "memory_type": memory_type,
+        "scenario": scenario,
+        "scope": scope,
+        "key": key,
+        "title": title,
+        "content": content,
+        "normalized_value": payload.get("normalized_value") if isinstance(payload.get("normalized_value"), dict) else {},
+        "confidence": float(payload.get("confidence") or 0.8),
+        "status": normalize_memory_status(payload.get("status")),
+        "sensitivity": str(payload.get("sensitivity") or payload.get("visibility") or "private"),
+        "visibility": normalize_visibility(payload.get("visibility") or payload.get("sensitivity")),
+        "source_event_ids": source_event_ids,
+        "linked_note_ids": linked_note_ids,
+        "path": existing["path"] if existing else "",
+        "version": version,
+        "last_used_at": payload.get("last_used_at") or (existing["last_used_at"] if existing else ""),
+        "expires_at": str(payload.get("expires_at") or (existing["expires_at"] if existing else "") or ""),
+        "created_at": created_at,
+        "updated_at": now,
+        "project": str(payload.get("project") or payload.get("project_id") or ""),
+    }
+    path = write_agent_memory_file(memory)
+    memory["path"] = str(path)
+    conn.execute(
+        """
+        INSERT INTO agent_memories (
+          id, memory_type, scenario, scope, key, title, content, normalized_value,
+          confidence, status, sensitivity, visibility, source_event_ids,
+          linked_note_ids, path, version, last_used_at, expires_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key, scenario, scope) DO UPDATE SET
+          memory_type = excluded.memory_type,
+          title = excluded.title,
+          content = excluded.content,
+          normalized_value = excluded.normalized_value,
+          confidence = excluded.confidence,
+          status = excluded.status,
+          sensitivity = excluded.sensitivity,
+          visibility = excluded.visibility,
+          source_event_ids = excluded.source_event_ids,
+          linked_note_ids = excluded.linked_note_ids,
+          path = excluded.path,
+          version = excluded.version,
+          last_used_at = excluded.last_used_at,
+          expires_at = excluded.expires_at,
+          updated_at = excluded.updated_at
+        """,
+        (
+            memory_id,
+            memory_type,
+            scenario,
+            scope,
+            key,
+            title,
+            content,
+            json.dumps(memory["normalized_value"], ensure_ascii=False),
+            memory["confidence"],
+            memory["status"],
+            memory["sensitivity"],
+            memory["visibility"],
+            json.dumps(source_event_ids, ensure_ascii=False),
+            json.dumps(linked_note_ids, ensure_ascii=False),
+            str(path),
+            version,
+            memory["last_used_at"],
+            memory["expires_at"],
+            created_at,
+            now,
+        ),
+    )
+    audit(conn, "upsert_agent_memory", "agent_memory", memory_id, {"key": key, "scenario": scenario, "scope": scope})
+    return {"id": memory_id, "path": str(path), "version": version}
+
+
+def confirm_memory(conn: sqlite3.Connection, item_id: str, payload: dict) -> dict:
+    item = conn.execute("SELECT * FROM inbox_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        raise KeyError("inbox item not found")
+    item_data = row_to_dict(item)
+    metadata = item_data.get("metadata") or {}
+    now = now_iso()
+    source_ids = as_string_list(metadata.get("source_refs")) or [item["source_event_id"]]
+    memory_payload = {
+        "memory_type": payload.get("memory_type") or metadata.get("memory_type") or "preference",
+        "scenario": payload.get("scenario") or metadata.get("scenario") or "global",
+        "scope": payload.get("scope") or metadata.get("scope") or "global",
+        "key": payload.get("key") or metadata.get("key") or metadata.get("normalized_key") or "",
+        "title": payload.get("title") or item["title"],
+        "content": payload.get("content") or item["content"],
+        "confidence": payload.get("confidence") or metadata.get("confidence") or item["confidence"],
+        "visibility": payload.get("visibility") or metadata.get("visibility") or "private",
+        "sensitivity": payload.get("sensitivity") or metadata.get("sensitivity") or metadata.get("visibility") or "private",
+        "status": payload.get("status") or "active",
+        "source_event_ids": source_ids,
+        "normalized_value": payload.get("normalized_value") or metadata.get("normalized_value") or {},
+        "project": payload.get("project") or metadata.get("project") or "",
+    }
+    memory_result = create_agent_memory(conn, memory_payload)
+    metadata["materialized_memory_id"] = memory_result["id"]
+    metadata["materialized_path"] = memory_result["path"]
+    metadata["materialized_at"] = now
+    conn.execute(
+        "UPDATE inbox_items SET status = '已确认', metadata = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(metadata, ensure_ascii=False), now, item_id),
+    )
+    resolve_pending_confirmations(conn, "inbox_item", item_id, "confirmed")
+    audit(conn, "confirm_memory", "agent_memory", memory_result["id"], {"inbox_item_id": item_id})
+    return {"memory_id": memory_result["id"], "path": memory_result["path"]}
+
+
+def knowledge_spaces_payload(conn: sqlite3.Connection) -> list[dict]:
+    spaces = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM knowledge_spaces ORDER BY sort_order ASC").fetchall()
+    ]
+    categories = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM knowledge_categories ORDER BY sort_order ASC").fetchall()
+    ]
+    categories_by_space: dict[str, list[dict]] = {}
+    for category in categories:
+        categories_by_space.setdefault(category["space_id"], []).append(category)
+    for space in spaces:
+        space["categories"] = categories_by_space.get(space["id"], [])
+    return spaces
+
+
+def default_knowledge_category_id(category: str, storage_target: str, visibility: str) -> str:
+    text = str(category or "").strip()
+    if storage_target == "obsidian_public_vault" or visibility == "public":
+        if re.search(r"工具|命令|CLI|MCP", text, re.I):
+            return "cat_public_tools"
+        if re.search(r"方法|方案|复盘|设计", text, re.I):
+            return "cat_public_methods"
+        if re.search(r"资料|文章|论文|学习|待读", text, re.I):
+            return "cat_public_resources"
+        return "cat_public_concepts"
+    if re.search(r"命令|构建|编译|代码|Repo|review|错误", text, re.I):
+        if re.search(r"命令|构建|编译", text, re.I):
+            return "cat_coding_commands"
+        if re.search(r"错误|异常", text, re.I):
+            return "cat_coding_errors"
+        if re.search(r"review|规范", text, re.I):
+            return "cat_coding_review"
+        return "cat_coding_repo"
+    if re.search(r"会议|妙记", text, re.I):
+        return "cat_work_meetings"
+    if re.search(r"周报|月报|报告|总结", text, re.I):
+        return "cat_work_reports"
+    if re.search(r"实验|Libra|AB", text, re.I):
+        return "cat_work_experiments"
+    if re.search(r"个人|目标|偏好|模板", text, re.I):
+        return "cat_personal_goals"
+    return "cat_work_project_context"
+
+
+def link_note_category(
+    conn: sqlite3.Connection,
+    note_id: str,
+    category: str,
+    storage_target: str,
+    visibility: str,
+    explicit_category_id: str = "",
+) -> str:
+    category_id = explicit_category_id or default_knowledge_category_id(category, storage_target, visibility)
+    row = conn.execute("SELECT id FROM knowledge_categories WHERE id = ?", (category_id,)).fetchone()
+    if not row:
+        return ""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO note_categories (note_id, category_id, is_primary, created_at)
+        VALUES (?, ?, 1, ?)
+        """,
+        (note_id, category_id, now_iso()),
+    )
+    return category_id
+
+
+def agent_memory_context(conn: sqlite3.Connection, scenario: str = "global", project: str = "") -> dict:
+    scenario_value = str(scenario or "global").strip().lower() or "global"
+    project_value = str(project or "").strip().lower()
+    rows = [
+        row_to_dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM agent_memories
+            WHERE status = 'active'
+              AND (scenario IN ('global', ?) OR scope IN ('global', 'project', 'repo'))
+            ORDER BY updated_at DESC
+            LIMIT 80
+            """,
+            (scenario_value,),
+        ).fetchall()
+    ]
+    memories = []
+    for row in rows:
+        key = str(row.get("key") or "").lower()
+        if project_value and row.get("scope") in ["project", "repo"] and project_value not in key and scenario_value != row.get("scenario"):
+            continue
+        memories.append(
+            {
+                "id": row["id"],
+                "memory_type": row["memory_type"],
+                "scenario": row["scenario"],
+                "scope": row["scope"],
+                "key": row["key"],
+                "title": row["title"],
+                "content": compact_text(row["content"], 520),
+                "confidence": row["confidence"],
+                "version": row["version"],
+                "updated_at": row["updated_at"],
+                "source_event_ids": row.get("source_event_ids") or [],
+            }
+        )
+        if len(memories) >= 30:
+            break
+    return {
+        "context_pack": {
+            "scenario": scenario_value,
+            "project": project,
+            "policy": "Agent 只读取 AgentMemory 和 KnowledgeBase 摘要；固定便笺属于 HumanWorkspace，不注入上下文。",
+        },
+        "memories": memories,
+    }
+
+
 def normalize_storage_target(value: object, visibility: str = "") -> str:
     target = str(value or "").strip().lower()
     aliases = {
@@ -4296,8 +4883,14 @@ def target_for_candidate(candidate_type: str, fallback: str = "") -> str:
         "task": "todo",
         "public_note": "note",
         "knowledge": "note",
+        "knowledge_note": "note",
+        "knowledge_candidate": "note",
         "work_record": "note",
         "report_material": "note",
+        "memory": "memory",
+        "memory_candidate": "memory",
+        "long_term_memory": "memory",
+        "agent_memory": "memory",
         "pinned": "pinned",
         "memo": "memo",
     }
@@ -4305,16 +4898,22 @@ def target_for_candidate(candidate_type: str, fallback: str = "") -> str:
 
 
 def item_type_for_candidate(candidate_type: str, target: str) -> str:
+    if target == "memory":
+        return "memory_candidate"
     if candidate_type == "work_record":
         return "work_record_candidate"
     if candidate_type == "report_material":
         return "report_material_candidate"
+    if candidate_type in ["knowledge_note", "knowledge_candidate"]:
+        return "knowledge_candidate"
     return item_type_for_target(target)
 
 
 def confirmation_policy(target: str, storage_target: str, risk_level: str, has_tool_actions: bool, due_at: str = "") -> str:
     if risk_level == "high":
         return "double_confirm"
+    if target == "memory":
+        return "instant_confirm"
     if has_tool_actions or storage_target == "feishu_doc":
         return "instant_confirm"
     if target == "todo" or due_at:
@@ -4429,26 +5028,25 @@ def item_type_for_target(target: str) -> str:
         return "note_candidate"
     if target == "pinned":
         return "pinned_candidate"
+    if target == "memory":
+        return "memory_candidate"
     return "memo"
 
 
-def agent_context_payload(conn: sqlite3.Connection) -> dict:
+def agent_context_payload(conn: sqlite3.Connection, scenario: str = "global", project: str = "") -> dict:
     notes = [row_to_dict(row) for row in conn.execute("SELECT * FROM notes ORDER BY updated_at DESC LIMIT 120").fetchall()]
     tasks = [row_to_dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 120").fetchall()]
-    pinned = get_pinned_slots(conn)
     projects = set()
     tags = set()
     for note in notes:
-        for project in note.get("projects") or []:
-            projects.add(project)
+        for note_project in note.get("projects") or []:
+            projects.add(note_project)
         for tag in note.get("tags") or []:
             tags.add(tag)
     for task in tasks:
         if task.get("project_id"):
             projects.add(task["project_id"])
-    for slot in pinned:
-        if slot.get("category"):
-            tags.add(slot["category"])
+    memory_payload = agent_memory_context(conn, scenario, project)
     return {
         "workspace": "Ayla personal agent workspace",
         "today": today_key(),
@@ -4458,9 +5056,11 @@ def agent_context_payload(conn: sqlite3.Connection) -> dict:
         "visibility": ["private", "internal", "public"],
         "public_vault_sections": sorted(set(PUBLIC_CATEGORY_DIRS.values())),
         "local_state_sections": sorted(set(LOCAL_STATE_CATEGORY_DIRS.values())),
+        "agent_memory_root": str(AGENT_MEMORY_ROOT),
+        "agent_memory": memory_payload,
+        "knowledge_spaces": knowledge_spaces_payload(conn),
         "projects": sorted(projects),
         "tags": sorted(tags),
-        "pinned_slots": [{"title": item["title"], "category": item["category"]} for item in pinned],
         "agent_roles": AGENT_ROLES,
         "connectors": CONNECTORS,
         "permission_policies": PERMISSION_POLICIES,
@@ -4468,9 +5068,11 @@ def agent_context_payload(conn: sqlite3.Connection) -> dict:
             "intent": "capture|task|public_knowledge|work_record|query|summary|external_action",
             "candidates": [
                 {
-                    "type": "todo|public_note|work_record|pinned|memo|report_material",
+                    "type": "todo|public_note|work_record|knowledge_candidate|memory_candidate|pinned|memo|report_material",
                     "title": "候选标题",
                     "content": "候选内容",
+                    "scenario": "coding|work|research|writing|planning|daily|global",
+                    "memory_type": "preference|rule|project_context|workflow|tool_usage|decision|user_profile|writing_style",
                     "storage_target": "local_state|feishu_doc|obsidian_public_vault",
                     "visibility": "public|private|internal",
                     "tags": ["topic/agent"],
@@ -4504,6 +5106,8 @@ def agent_context_payload(conn: sqlite3.Connection) -> dict:
         "rules": [
             "飞书 Bot 是主入口；本地 Web 是展示、编辑和确认层。",
             "所有输入先落 SourceEvent 和 InboxItem，再生成候选结果。",
+            "固定便笺属于 HumanWorkspace，只给用户看，不注入 Agent context。",
+            "AI 长期记忆只从 AgentMemory 读取，按 scenario context pack 提供给外部 Agent。",
             "公开知识只在 visibility=public 且 storage_target=obsidian_public_vault 时写入 PublicKnowledgeVault。",
             "工作沉淀、会议纪要、实验状态和 TODO 默认留在 LocalWorkState 或飞书文档引用。",
             "低风险本地写入日维度批量确认；外部写操作、DDL、删除和公开发布必须即时或二次确认。",
@@ -4610,9 +5214,14 @@ def agent_ingest(conn: sqlite3.Connection, payload: dict) -> dict:
         if candidate_type == "public_note":
             visibility = "public"
             storage_target = "obsidian_public_vault"
+        if candidate_type in ["knowledge_note", "knowledge_candidate"]:
+            target = "note"
         if candidate_type in ["work_record", "report_material"]:
             visibility = "internal" if visibility == "private" else visibility
             storage_target = "local_state" if storage_target == "obsidian_public_vault" else storage_target
+        if target == "memory":
+            visibility = "private" if visibility == "public" else visibility
+            storage_target = "local_state"
         risk_level = normalize_risk_level(candidate.get("risk_level") or payload.get("risk_level") or ("medium" if is_risk_like(candidate_content) else "low"))
         due_at = str(candidate.get("due_at") or payload.get("due_at") or "").strip()
         priority = str(candidate.get("priority") or payload.get("priority") or "normal")
@@ -4647,6 +5256,13 @@ def agent_ingest(conn: sqlite3.Connection, payload: dict) -> dict:
                 "risk_level": risk_level,
                 "requires_confirmation": requires_confirmation,
                 "confirmation_policy": policy,
+                "memory_type": str(candidate.get("memory_type") or payload.get("memory_type") or ""),
+                "scenario": str(candidate.get("scenario") or payload.get("scenario") or "global"),
+                "scope": str(candidate.get("scope") or payload.get("scope") or "global"),
+                "key": str(candidate.get("key") or candidate.get("normalized_key") or payload.get("key") or payload.get("normalized_key") or ""),
+                "normalized_value": candidate.get("normalized_value") if isinstance(candidate.get("normalized_value"), dict) else {},
+                "knowledge_space": str(candidate.get("knowledge_space") or payload.get("knowledge_space") or ""),
+                "knowledge_category": str(candidate.get("knowledge_category") or payload.get("knowledge_category") or candidate_category),
                 "source_url": str(candidate.get("source_url") or source_url),
                 "source_refs": source_refs,
                 "agent_run_id": run_id,
@@ -4712,6 +5328,19 @@ def agent_ingest(conn: sqlite3.Connection, payload: dict) -> dict:
             elif target == "pinned":
                 direct_result = create_pinned_slot(conn, {"title": candidate_title, "content": candidate_content, "category": candidate_category})
                 update_inbox_status(conn, item_id, "已确认")
+            elif target == "memory":
+                direct_result = confirm_memory(
+                    conn,
+                    item_id,
+                    {
+                        "title": candidate_title,
+                        "content": candidate_content,
+                        "memory_type": candidate.get("memory_type") or payload.get("memory_type") or "preference",
+                        "scenario": candidate.get("scenario") or payload.get("scenario") or "global",
+                        "scope": candidate.get("scope") or payload.get("scope") or "global",
+                        "key": candidate.get("key") or candidate.get("normalized_key") or payload.get("key") or payload.get("normalized_key") or "",
+                    },
+                )
             else:
                 update_inbox_status(conn, item_id, "已归档")
                 direct_result = {"archived": True}
@@ -5086,7 +5715,7 @@ def orchestration_payload(settings: dict) -> dict:
             {"key": "inbox", "title": "Inbox 收件箱", "detail": "所有原文先成为 SourceEvent 和 InboxItem，保留来源。"},
             {"key": "agent", "title": "Agent 编排层", "detail": "Orchestrator 生成结构化候选，并记录 AgentRun。"},
             {"key": "confirm", "title": "人工确认层", "detail": "Review Agent 按风险进入批量、即时或二次确认。"},
-            {"key": "storage", "title": "落库与展示层", "detail": "TODO、本地工作库、公开知识 Vault、固定便笺和报告素材分流。"},
+            {"key": "storage", "title": "落库与展示层", "detail": "TODO、本地工作库、公开知识 Vault、AgentMemory、固定便笺和报告素材分流。"},
         ],
         "agents": AGENT_ROLES,
         "connectors": CONNECTORS,
@@ -5094,11 +5723,12 @@ def orchestration_payload(settings: dict) -> dict:
         "storage_roots": {
             "state_root": settings.get("state_root_path"),
             "public_vault": settings.get("public_vault_path") or settings.get("vault_path"),
+            "agent_memory": str(AGENT_MEMORY_ROOT),
             "work_library": settings.get("work_library_path"),
             "runtime": str(RUNTIME_ROOT),
         },
         "mvp_focus": [
-            "P0 本地闭环：记录 -> 候选 -> 人工确认 -> TODO / 本地工作库 / 公开知识 / 固定便笺。",
+            "P0 本地闭环：记录 -> 候选 -> 人工确认 -> TODO / AgentMemory / 本地工作库 / 公开知识 / 固定便笺。",
             "P1 飞书接入：飞书 Bot、妙记和日历优先。",
             "P2 工作数据看板：Libra、Meego、GitHub 状态只读聚合。",
             "P3 资产化复盘：周报、月报、季度总结草稿和公开知识图谱。",
@@ -5295,7 +5925,13 @@ def link_summaries_payload(events: list[dict]) -> list[dict]:
 
 
 def state_payload(conn: sqlite3.Connection) -> dict:
-    materialized_defaults = materialize_ai_summary_defaults(conn)
+    today = today_key()
+    daily_rollover = ensure_daily_rollover(conn)
+    materialized_defaults = (
+        daily_rollover.get("materialized_defaults")
+        if daily_rollover.get("changed")
+        else materialize_ai_summary_defaults(conn)
+    )
     inbox = [
         row_to_dict(row)
         for row in conn.execute(
@@ -5334,26 +5970,39 @@ def state_payload(conn: sqlite3.Connection) -> dict:
         row_to_dict(row)
         for row in conn.execute("SELECT * FROM confirmations ORDER BY updated_at DESC LIMIT 120").fetchall()
     ]
+    agent_memories = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM agent_memories ORDER BY updated_at DESC LIMIT 200").fetchall()
+    ]
+    knowledge_spaces = knowledge_spaces_payload(conn)
     settings = get_settings(conn)
+    daily_archive = daily_archive_payload(conn, today)
+    today_work_log = get_daily_work_log(conn, today)
     stats = {
         "pending_inbox": sum(1 for item in inbox if item["status"] in ["待确认", "未处理", "需补充", "自动分类"]),
         "today_tasks": sum(1 for task in tasks if task["status"] not in ["已完成", "已取消", "已归档"]),
         "notes": len(notes),
+        "agent_memories": sum(1 for item in agent_memories if item["status"] == "active"),
         "risks": sum(1 for item in inbox if (item.get("metadata") or {}).get("risk")),
     }
     return {
+        "today": today,
+        "next_daily_refresh_at": daily_rollover["next_refresh_at"],
+        "daily_rollover": daily_rollover,
         "profile": workspace_account_payload(settings),
         "settings": settings,
         "stats": stats,
         "inbox": inbox,
         "tasks": tasks,
         "notes": notes,
+        "agent_memories": agent_memories,
+        "knowledge_spaces": knowledge_spaces,
         "events": events,
-        "link_summaries": link_summaries_payload(events),
+        "link_summaries": link_summaries_payload(daily_archive["events"]),
         "pinned_slots": get_pinned_slots(conn),
         "daily_review": daily_review_payload(conn),
-        "daily_archive": daily_archive_payload(conn),
-        "today_work_log": get_daily_work_log(conn),
+        "daily_archive": daily_archive,
+        "today_work_log": today_work_log,
         "audit_logs": audit_rows,
         "agent_runs": agent_runs,
         "confirmations": confirmations,
@@ -5415,7 +6064,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             with db_connect() as conn:
                 if not self.ensure_agent_auth(conn):
                     return
-                self.send_json(agent_context_payload(conn))
+                query = parse_qs(parsed.query)
+                scenario = (query.get("scenario") or ["global"])[0]
+                project = (query.get("project") or [""])[0]
+                self.send_json(agent_context_payload(conn, scenario=scenario, project=project))
             return
         if parsed.path == "/api/connectors/lark/status":
             with db_connect() as conn:
@@ -5564,6 +6216,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 match = re.match(r"^/api/inbox/([^/]+)/confirm-note$", parsed.path)
                 if match:
                     result = confirm_note(conn, unquote(match.group(1)), payload)
+                    conn.commit()
+                    self.send_json(result, HTTPStatus.CREATED)
+                    return
+                match = re.match(r"^/api/inbox/([^/]+)/confirm-memory$", parsed.path)
+                if match:
+                    result = confirm_memory(conn, unquote(match.group(1)), payload)
                     conn.commit()
                     self.send_json(result, HTTPStatus.CREATED)
                     return

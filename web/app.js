@@ -62,6 +62,7 @@ const state = {
   taskMemoryId: "",
   taskEditId: "",
   todoAddQuadrant: "",
+  dailyRefreshTimer: 0,
   okrYear: localStorage.getItem("aylaOkrYear") || "2026",
   okrQuarter: localStorage.getItem("aylaOkrQuarter") || "Q2",
   okrWindow: localStorage.getItem("aylaOkrWindow") || "7",
@@ -121,13 +122,21 @@ function todayDateKey() {
   return dateKeyOffset(0);
 }
 
-function dateKeyOffset(daysOffset) {
-  const date = new Date();
+function workbenchTodayKey() {
+  return state.data?.today || todayDateKey();
+}
+
+function dateKeyOffset(daysOffset, baseValue = null) {
+  const date = baseValue ? new Date(baseValue) : new Date();
   date.setDate(date.getDate() + daysOffset);
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function workbenchDateKeyOffset(daysOffset) {
+  return dateKeyOffset(daysOffset, `${workbenchTodayKey()}T00:00:00`);
 }
 
 function escapeHtml(value) {
@@ -275,6 +284,7 @@ async function api(path, options = {}) {
 
 async function loadState() {
   state.data = await api("/api/state");
+  scheduleDailyRefresh();
   renderAccountChrome();
   statusEl.textContent = state.data.workspace;
   if (!state.selectedNoteId && state.data.notes.length) {
@@ -282,6 +292,30 @@ async function loadState() {
   }
   updateNotificationButton();
   checkTaskNotifications();
+}
+
+function scheduleDailyRefresh() {
+  if (state.dailyRefreshTimer) {
+    window.clearTimeout(state.dailyRefreshTimer);
+    state.dailyRefreshTimer = 0;
+  }
+  const refreshAt = state.data?.next_daily_refresh_at;
+  const refreshTime = refreshAt ? new Date(refreshAt).getTime() : Number.NaN;
+  if (!Number.isFinite(refreshTime)) return;
+  const delay = Math.max(1000, Math.min(refreshTime - Date.now() + 1500, 24 * 60 * 60 * 1000 + 60 * 1000));
+  state.dailyRefreshTimer = window.setTimeout(async () => {
+    try {
+      await refresh("已切换到新的自然日，今日整理已更新", { tone: "info" });
+    } catch (error) {
+      showToast(error.message);
+      scheduleDailyRefresh();
+    }
+  }, delay);
+}
+
+async function refreshIfNaturalDayChanged() {
+  if (!state.data?.today || state.data.today === todayDateKey()) return;
+  await refresh("已切换到新的自然日，今日整理已更新", { tone: "info" });
 }
 
 function normalizeView(view) {
@@ -365,6 +399,8 @@ function typeLabel(type) {
     task_candidate: "TODO 候选",
     summary: "摘要",
     note_candidate: "笔记候选",
+    knowledge_candidate: "知识库候选",
+    memory_candidate: "Agent 记忆候选",
     pinned_candidate: "固定便笺候选",
     work_record_candidate: "工作沉淀候选",
     report_material_candidate: "总结素材候选",
@@ -376,6 +412,7 @@ function targetLabel(target) {
   const labels = {
     todo: "自动归为 TODO",
     note: "自动归为知识",
+    memory: "进入 AgentMemory",
     pinned: "自动归为便笺",
     memo: "仅归档备忘",
   };
@@ -422,7 +459,7 @@ function sourceLink(url) {
 }
 
 function isTodayRecord(item) {
-  return isTodayValue(item.updated_at) || isTodayValue(item.created_at);
+  return isTodayValue(item.updated_at) || isTodayValue(item.created_at) || isTodayValue(item.collected_at);
 }
 
 function notePreview(note) {
@@ -444,7 +481,7 @@ function isActiveTask(task) {
 }
 
 function isTodayValue(value) {
-  return Boolean(value && String(value).slice(0, 10) === todayDateKey());
+  return Boolean(value && String(value).slice(0, 10) === workbenchTodayKey());
 }
 
 function pad2(value) {
@@ -534,7 +571,6 @@ function taskRuntimeTone(task) {
 }
 
 function todayRelevantTasks() {
-  const today = todayDateKey();
   return (state.data.tasks || [])
     .filter((task) => isActiveTask(task) || isTodayValue(task.due_at) || isTodayValue(task.completed_at) || isTodayValue(task.updated_at))
     .slice(0, 24);
@@ -608,20 +644,20 @@ function renderStats() {
         <span>知识笔记</span>
       </div>
       <div class="stat">
-        <strong>${stats.risks}</strong>
-        <span>风险提示</span>
+        <strong>${stats.agent_memories || 0}</strong>
+        <span>Agent 记忆</span>
       </div>
     </div>
   `;
 }
 
-function weekdayLabel() {
-  return ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][new Date().getDay()];
+function weekdayLabel(date = new Date()) {
+  return ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][date.getDay()];
 }
 
 function todayDisplayLabel() {
-  const date = new Date();
-  return `${date.getMonth() + 1}月${date.getDate()}日 ${weekdayLabel()}`;
+  const date = new Date(`${workbenchTodayKey()}T00:00:00`);
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${weekdayLabel(date)}`;
 }
 
 function larkConnectorPill() {
@@ -687,16 +723,16 @@ function renderLarkBindingSession(session) {
 }
 
 function latestEventsByType(type, limit = 3) {
-  return (state.data.events || []).filter((event) => event.source_type === type).slice(0, limit);
+  return (state.data.events || []).filter((event) => event.source_type === type && isTodayRecord(event)).slice(0, limit);
 }
 
 function renderDailyBriefCard() {
-  const stats = state.data.stats || {};
   const review = state.data.daily_review || {};
   const archive = state.data.daily_archive || { counts: {} };
   const calendarEvents = latestEventsByType("lark_calendar", 3);
   const minutesEvents = latestEventsByType("lark_minutes", 2);
-  const activeTasks = (state.data.tasks || []).filter(isActiveTask);
+  const activeTasks = todayRelevantTasks().filter(isActiveTask);
+  const todayPending = archive.counts?.adjustable || review.today_count || 0;
   return `
     <article class="card span-5 daily-brief-card">
       <div class="card-header">
@@ -710,7 +746,7 @@ function renderDailyBriefCard() {
         <section class="overview-block date-display">
           <h4>今日日期</h4>
           <div class="date-main">${todayDisplayLabel()}</div>
-          <div class="date-sub">${todayDateKey()} · 本地时间</div>
+          <div class="date-sub">${workbenchTodayKey()} · 本地时间</div>
         </section>
         <section class="overview-block">
           <h4>数据源</h4>
@@ -722,10 +758,10 @@ function renderDailyBriefCard() {
         <section class="overview-block">
           <h4>今日信号</h4>
           <div class="metric-grid mini">
-            <div><strong>${stats.pending_inbox || 0}</strong><span>待整理</span></div>
+            <div><strong>${todayPending}</strong><span>待整理</span></div>
             <div><strong>${activeTasks.length}</strong><span>未完成</span></div>
             <div><strong>${archive.counts?.events || 0}</strong><span>输入</span></div>
-            <div><strong>${review.pending_count || 0}</strong><span>候选</span></div>
+            <div><strong>${review.today_count || 0}</strong><span>候选</span></div>
           </div>
         </section>
         <section class="overview-block">
@@ -758,11 +794,11 @@ function renderDailyBriefCard() {
 function renderAiSummaryCard() {
   const log = state.data.today_work_log || {};
   const archive = state.data.daily_archive || { adjustable: [] };
-  const pendingInbox = (state.data.inbox || []).filter((item) => !["已确认", "已忽略", "已归档", "已发布"].includes(item.status));
-  const recentRuns = state.data.agent_runs || [];
+  const pendingInbox = (state.data.inbox || []).filter((item) => isTodayRecord(item) && !["已确认", "已忽略", "已归档", "已发布"].includes(item.status));
+  const recentRuns = (state.data.agent_runs || []).filter(isTodayRecord);
   const lead = log.summary || log.generated_report || "今天的输入会被整理成候选、TODO 和本地工作沉淀，等待你确认。";
   const knownTodos = todayRelevantTasks().filter(isActiveTask).slice(0, 2);
-  const linkSummaries = (state.data.link_summaries || []).slice(0, 3);
+  const linkSummaries = (state.data.link_summaries || []).filter(isTodayRecord).slice(0, 3);
   return `
     <article class="card span-7 ai-summary-card">
       <div class="card-header">
@@ -939,10 +975,10 @@ function renderWorkspaceHero() {
         <h2>今日工作台</h2>
         <p>只保留当天有效的工作信号：总结、TODO、备忘归档、待调整入口。</p>
         <div class="hero-meta">
-          ${metaPill(todayDateKey(), "violet")}
+          ${metaPill(workbenchTodayKey(), "violet")}
           ${metaPill(`${stats.today_tasks || 0} 个未完成 TODO`, "green")}
           ${metaPill(`${archive.counts?.events || 0} 条今日备忘`)}
-          ${metaPill(`${review.pending_count || 0} 条待整理`, review.pending_count ? "amber" : "")}
+          ${metaPill(`${review.today_count || 0} 条今日待整理`, review.today_count ? "amber" : "")}
           ${metaPill(modelStatus.enabled ? "模型整理" : "本地规则", modelStatus.enabled ? "green" : "")}
         </div>
       </div>
@@ -1121,6 +1157,13 @@ function renderInboxItem(item) {
   const policy = metadata.confirmation_policy ? metaPill(policyLabel(metadata.confirmation_policy), metadata.confirmation_policy === "double_confirm" ? "coral" : metadata.confirmation_policy === "instant_confirm" ? "amber" : "green") : "";
   const canAct = !["已确认", "已忽略", "已归档", "已发布"].includes(item.status);
   const confirmNoteText = metadata.storage_target === "obsidian_public_vault" ? "入公开知识" : metadata.candidate_type === "report_material" ? "入总结素材" : "确认落库";
+  const isMemoryCandidate = item.item_type === "memory_candidate" || metadata.auto_target === "memory";
+  const primaryActions = isMemoryCandidate
+    ? `<button class="button" data-action="confirm-memory" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">入 AgentMemory</button>`
+    : `
+        <button class="button" data-action="confirm-task" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">转 TODO</button>
+        <button class="button secondary" data-action="confirm-note" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">${confirmNoteText}</button>
+      `;
   return `
     <article class="item-row">
       <div class="meta-line">
@@ -1144,8 +1187,7 @@ function renderInboxItem(item) {
         <p class="content-preview">${escapeHtml(item.content)}</p>
       </div>
       <div class="row-actions">
-        <button class="button" data-action="confirm-task" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">转 TODO</button>
-        <button class="button secondary" data-action="confirm-note" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">${confirmNoteText}</button>
+        ${primaryActions}
         <button class="button secondary" data-action="need-info" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">需补充</button>
         <button class="button warning" data-action="ignore" data-id="${escapeHtml(item.id)}" ${canAct ? "" : "disabled"} type="button">忽略</button>
       </div>
@@ -1324,7 +1366,7 @@ function renderAlarmOverlay() {
 }
 
 function renderDailyLogPanel() {
-  const log = state.data.today_work_log || { date: todayDateKey(), summary: "", report: "" };
+  const log = state.data.today_work_log || { date: workbenchTodayKey(), summary: "", report: "" };
   return `
     <section class="panel daily-log-panel">
       <div class="section-head">
@@ -1335,7 +1377,7 @@ function renderDailyLogPanel() {
         ${log.updated_at ? metaPill(`更新 ${formatDate(log.updated_at)}`, "violet") : metaPill("今日未记录", "amber")}
       </div>
       <form class="memo-form" data-form="daily-log">
-        <input type="hidden" name="date" value="${escapeHtml(log.date || todayDateKey())}" />
+        <input type="hidden" name="date" value="${escapeHtml(log.date || workbenchTodayKey())}" />
         <div class="form-row">
           <label for="daily-summary">今天真正做成的事</label>
           <textarea class="textarea daily-summary" id="daily-summary" name="summary" placeholder="例如：完成首页重构、确认 Agent 接入边界、沉淀 3 条后续 TODO。">${escapeHtml(log.summary || "")}</textarea>
@@ -2056,8 +2098,11 @@ function renderAssetGraphMini() {
 function renderKnowledge() {
   const notes = state.data.notes || [];
   const settings = state.data.settings || {};
+  const memories = state.data.agent_memories || [];
+  const spaces = state.data.knowledge_spaces || [];
   const localAssets = notes.filter((note) => !note.publishable).slice(0, 5);
   const publicAssets = notes.filter((note) => note.publishable).slice(0, 5);
+  const activeMemories = memories.filter((memory) => memory.status === "active");
   const pendingArchive = (state.data.inbox || []).filter((item) => ["note_candidate", "work_record_candidate", "report_material_candidate"].includes(item.item_type)).slice(0, 4);
   const categories = [
     ["技术方案", notes.filter((note) => /方案|设计|技术/.test(note.title)).length],
@@ -2076,7 +2121,35 @@ function renderKnowledge() {
     <div class="prototype-page assets-page">
       <div class="grid-12">
         <article class="card span-12">
-          <div class="card-header"><div class="card-title"><h3>资产看板</h3><span>个人知识沉淀与工作文档索引分栏管理</span></div><span class="pill">Double Space</span></div>
+          <div class="card-header"><div class="card-title"><h3>资产看板</h3><span>人看的资产视图与 Agent 读取的持久层分开管理</span></div><span class="pill">Double Space</span></div>
+          <div class="agent-card-grid">
+            <article class="agent-card">
+              <div class="meta-line">${metaPill("AgentMemory", "violet")}${metaPill(`${activeMemories.length} 条 active`)}</div>
+              <h3>AI 读的长期记忆</h3>
+              <p>固定便笺不进入 Agent context；这里保存偏好、规则、项目上下文、工具用法和可持续迭代的自学习结果。</p>
+              <ul class="asset-list compact-list">
+                ${activeMemories.slice(0, 4).map((memory) => `
+                  <li>
+                    <div class="asset-meta"><strong>${escapeHtml(memory.title)}</strong><small>${escapeHtml(memory.scenario || "global")} · ${escapeHtml(memory.memory_type || "memory")} · v${escapeHtml(memory.version || 1)}</small></div>
+                    <span class="pill">${escapeHtml(memory.scope || "global")}</span>
+                  </li>
+                `).join("") || `<li><div class="asset-meta"><strong>暂无 Agent 记忆</strong><small>从收件箱确认 memory_candidate 后写入</small></div></li>`}
+              </ul>
+            </article>
+            <article class="agent-card">
+              <div class="meta-line">${metaPill("Knowledge Spaces", "green")}${metaPill(`${spaces.length} 个场景`)}</div>
+              <h3>知识库分类存储</h3>
+              <p>长内容按 work / coding / research / personal / public 分场景落盘，Agent 只按需读取摘要和索引。</p>
+              <div class="doc-category">
+                ${spaces.map((space) => `<span class="pill">${escapeHtml(space.name)} · ${escapeHtml(space.storage_target)}</span>`).join("")}
+              </div>
+            </article>
+            <article class="agent-card">
+              <div class="meta-line">${metaPill("Context Pack", "amber")}</div>
+              <h3>场景化上下文</h3>
+              <p><code>/api/agent/context?scenario=coding&project=ayla</code> 只返回 AgentMemory、知识库索引和策略，不返回人看的固定便笺。</p>
+            </article>
+          </div>
           <div class="asset-columns">
             <section class="asset-column">
               <div class="card inner-card">
@@ -2648,8 +2721,8 @@ document.addEventListener("click", async (event) => {
     }
     if (action === "sync-lark-today" || action === "sync-lark-range") {
       const days = Math.max(1, Math.min(31, Number(state.data.settings.lark_sync_days || 7)));
-      const start = action === "sync-lark-today" ? todayDateKey() : dateKeyOffset(-(days - 1));
-      const end = todayDateKey();
+      const start = action === "sync-lark-today" ? workbenchTodayKey() : workbenchDateKeyOffset(-(days - 1));
+      const end = workbenchTodayKey();
       const result = await api("/api/connectors/lark/sync", {
         method: "POST",
         body: JSON.stringify({
@@ -2720,6 +2793,11 @@ document.addEventListener("click", async (event) => {
     if (action === "confirm-note") {
       await api(`/api/inbox/${encodeURIComponent(id)}/confirm-note`, { method: "POST", body: "{}" });
       await refresh("已写入知识库");
+      return;
+    }
+    if (action === "confirm-memory") {
+      await api(`/api/inbox/${encodeURIComponent(id)}/confirm-memory`, { method: "POST", body: "{}" });
+      await refresh("已写入 AgentMemory");
       return;
     }
     if (action === "remove-ai-archive") {
@@ -3043,6 +3121,16 @@ async function boot() {
 window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener("change", () => {
   if (state.prefs.uiMode === "system") {
     applyChromeState();
+  }
+});
+
+window.addEventListener("focus", () => {
+  refreshIfNaturalDayChanged().catch((error) => showToast(error.message));
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    refreshIfNaturalDayChanged().catch((error) => showToast(error.message));
   }
 });
 

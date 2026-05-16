@@ -87,6 +87,24 @@ permissionMode: default
 - 妙记中的 TODO 必须保留原始来源引用 `feishu_minutes:<token>`，并在 `content` 里写清会议、待办动作、相关人、截止时间或下一次同步时间；没有明确截止时间时 `due_at` 为空但仍保持 `requires_confirmation=true`。
 - 妙记中只适合作为周报、OKR 或复盘素材、且不是本人待办的内容，才使用 `report_material`；不要把完整妙记原文或普通会议背景直接转成长期知识。
 
+## Ayla Drop v1 飞书聊天文件规则
+
+如果调用方无法访问本机 Ayla API，可以让远端飞书 Bot 产出 `ayla.feishu_chat.daily.v1` JSON 文件，由本地 Ayla importer 定时读取。此时你应遵守：
+
+- 文件是来源数据，不是最终落库结果；不要在文件里虚构已经确认的 TODO、知识或记忆。
+- 顶层必须是 `kind=feishu_chat_daily_batch`，并包含 `date`、`batch_id`、`idempotency_key`、`producer` 和 `messages`。
+- `date` 使用消息发生日；远端写入方按 `incoming/YYYY-MM-DD/` 存放小批量 JSON 文件。
+- 每条 `messages[]` 必须有稳定 `message_id` 或 `idempotency_key`，用于 Ayla 去重。
+- `message_id` 对应后续 `source_refs` 时使用 `feishu_msg:<message_id>`。
+- `plain_text` 保留可读正文；结构化原始 payload 可放在 `raw.payload`，不要把 token、cookie、密钥写入 raw。
+- `ayla_hints` 只能作为路由提示，不能代替 Ayla 的人工确认策略。
+
+推荐文件路径：
+
+```text
+DropBox/feishu-chat/incoming/YYYY-MM-DD/{YYYYMMDD}T{HHmmss}-{producer_id}-{chat_id_or_mix}-{batch_id}.json
+```
+
 ## 来源引用
 
 调用方提供稳定来源时，优先使用稳定来源：

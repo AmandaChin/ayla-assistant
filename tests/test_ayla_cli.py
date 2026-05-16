@@ -13,6 +13,32 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class AylaCliInstallTests(unittest.TestCase):
+    def test_agent_vault_is_gitignored_and_init_creates_data_layout(self) -> None:
+        import ayla_cli
+
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn("/agent-vault/", gitignore)
+        self.assertTrue((REPO_ROOT / "scripts" / "init_ayla_workspace.py").is_file())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "AylaData"
+
+            result = ayla_cli.initialize_workspace(
+                source_root=REPO_ROOT,
+                data_root=data_root,
+                mode="test",
+            )
+
+            self.assertEqual(result["data_root"], str(data_root))
+            self.assertTrue((data_root / "AgentMemory" / "global").is_dir())
+            self.assertTrue((data_root / "AgentMemory" / "projects").is_dir())
+            self.assertTrue((data_root / "LocalWorkState" / "work_records").is_dir())
+            self.assertTrue((data_root / "PublicKnowledgeVault" / "00_Inbox").is_dir())
+            self.assertTrue((data_root / "system" / "database.sqlite").is_file())
+            self.assertTrue((data_root / "system" / "init.json").is_file())
+            self.assertEqual(result["knowledge_spaces"], ["work", "coding", "research", "personal", "public"])
+            self.assertEqual(result["agent_memories"], 0)
+
     def test_server_uses_ayla_home_for_data_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_root = Path(tmp) / "AylaData"

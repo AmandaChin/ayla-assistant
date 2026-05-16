@@ -1,0 +1,100 @@
+{
+  "schema_version": "ayla.feishu_chat.daily.v1",
+  "kind": "feishu_chat_daily_batch",
+  "date": "2026-05-16",
+  "batch_id": "openclaw-workbot-20260516-225000-001",
+  "idempotency_key": "openclaw-workbot:2026-05-16:batch001",
+  "created_at": "2026-05-16T22:50:00+08:00",
+  "producer": {
+    "type": "feishu_bot",
+    "name": "openclaw-workbot",
+    "bot_app_id": "cli_xxx",
+    "version": "1.0.0"
+  },
+  "messages": [
+    {
+      "message_id": "om_20260516_001",
+      "idempotency_key": "feishu_msg:om_20260516_001",
+      "created_at": "2026-05-16T22:45:12+08:00",
+      "updated_at": "",
+      "chat": {
+        "chat_id": "oc_xxxxx",
+        "chat_name": "双列图文搜索",
+        "chat_type": "group"
+      },
+      "sender": {
+        "id": "ou_sender_001",
+        "name": "张三",
+        "type": "user"
+      },
+      "content_type": "text",
+      "content": "明天需要确认图文筛选实验排期，看看是否还有阻塞。",
+      "plain_text": "明天需要确认图文筛选实验排期，看看是否还有阻塞。",
+      "mentions": [
+        {
+          "id": "ou_me",
+          "name": "安颖",
+          "is_me": true
+        }
+      ],
+      "mentioned_me": true,
+      "reply_to_me": false,
+      "authored_by_me": false,
+      "thread_id": "",
+      "root_message_id": "",
+      "source_url": "https://open.feishu.cn/message/om_20260516_001",
+      "attachments": [],
+      "links": [],
+      "labels": ["project", "todo_signal"],
+      "ayla_hints": {
+        "importance": "high",
+        "reason": "提到排期、确认、阻塞，并且 @ 了用户",
+        "suggested_target": "todo",
+        "project": "双列图文搜索"
+      },
+      "raw": {
+        "provider": "feishu",
+        "payload": {}
+      }
+    },
+    {
+      "message_id": "om_20260516_002",
+      "idempotency_key": "feishu_msg:om_20260516_002",
+      "created_at": "2026-05-16T22:48:03+08:00",
+      "updated_at": "",
+      "chat": {
+        "chat_id": "oc_xxxxx",
+        "chat_name": "双列图文搜索",
+        "chat_type": "group"
+      },
+      "sender": {
+        "id": "ou_sender_002",
+        "name": "李四",
+        "type": "user"
+      },
+      "content_type": "text",
+      "content": "今天评审结论：筛选入口先保留一期方案，图文垂搜空态复用综搜链路，后续补齐埋点口径。",
+      "plain_text": "今天评审结论：筛选入口先保留一期方案，图文垂搜空态复用综搜链路，后续补齐埋点口径。",
+      "mentions": [],
+      "mentioned_me": false,
+      "reply_to_me": false,
+      "authored_by_me": false,
+      "thread_id": "",
+      "root_message_id": "",
+      "source_url": "https://open.feishu.cn/message/om_20260516_002",
+      "attachments": [],
+      "links": [],
+      "labels": ["meeting_conclusion", "report_material"],
+      "ayla_hints": {
+        "importance": "medium",
+        "reason": "包含评审结论和后续埋点事项",
+        "suggested_target": "report_material",
+        "project": "双列图文搜索"
+      },
+      "raw": {
+        "provider": "feishu",
+        "payload": {}
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import mimetypes
@@ -25,6 +26,18 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
+
+
+def split_env_list(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,\n]", value or "") if item.strip()]
+
+
+def cors_origin_allowed(origin: str, allowed_origins: list[str]) -> bool:
+    if not origin or not allowed_origins:
+        return False
+    if "*" in allowed_origins:
+        return True
+    return origin in allowed_origins
 
 
 def default_project_root() -> Path:
@@ -109,6 +122,20 @@ DEFAULT_SETTINGS = {
     "agent_api_token": "",
     "last_daily_rollover_date": "",
     "last_daily_rollover_at": "",
+    "capture_mode": "hybrid",
+    "capture_important_chats": "",
+    "capture_meego_bound_chats": "",
+    "capture_keywords": "排期\n跟进\n确认\n评审\n上线\n阻塞\n需求\n技术方案\n会议纪要\n结论",
+    "browser_capture_allowlist": "larkoffice.com\nfeishu.cn\nmeego.larkoffice.com",
+    "capture_ingest_threshold": 0.35,
+    "capture_model_threshold": 0.65,
+    "capture_summary_threshold": 0.55,
+    "capture_daily_model_call_budget": 24,
+    "capture_daily_token_budget": 200000,
+    "capture_max_web_content_kb": 512,
+    "capture_raw_ttl_days": 14,
+    "capture_batch_interval_minutes": 15,
+    "capture_hourly_pull_limit": 500,
 }
 
 PUBLIC_CATEGORY_DIRS = {
@@ -2270,6 +2297,528 @@ def existing_lark_derived_item(
     return None
 
 
+CAPTURE_SOURCE_TYPES = {"feishu_message", "feishu_doc_event", "browser_page", "browser_share"}
+CAPTURE_ARCHIVE_SOURCE_TYPES = {"feishu_doc_event", "browser_page", "browser_share"}
+PASSIVE_CAPTURE_SOURCE_TYPES = {"feishu_message", "feishu_doc_event", "browser_page"}
+MANUAL_CAPTURE_SOURCE_TYPES = {"browser_share", "manual_memo", "web_memo", "lark_doc_memo"}
+NOISE_PHRASES = {"收到", "好的", "好", "ok", "OK", "赞", "+1", "mark", "已阅", "辛苦", "了解"}
+ACTION_SIGNAL_WORDS = [
+    "ddl",
+    "deadline",
+    "todo",
+    "待办",
+    "帮忙",
+    "跟进",
+    "确认",
+    "评审",
+    "排期",
+    "上线",
+    "处理",
+    "完成",
+    "同步",
+    "阻塞",
+    "风险",
+    "负责人",
+    "节点",
+]
+MEEGO_SIGNAL_RE = re.compile(r"\b(?:FEAT|BUG|TASK|REQ|MEGO|MEEGO)[-_]?\d+\b", re.I)
+
+
+def settings_text_list(settings: dict, key: str) -> list[str]:
+    raw = settings.get(key)
+    if isinstance(raw, list):
+        values = raw
+    else:
+        values = re.split(r"[\n,，;；]+", str(raw or ""))
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def setting_float(settings: dict, key: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(settings.get(key))
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def source_domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except ValueError:
+        return ""
+
+
+def text_matches_any(text: str, patterns: list[str]) -> bool:
+    lowered = text.lower()
+    return any(pattern.lower() in lowered for pattern in patterns if pattern)
+
+
+def capture_owner_aliases(settings: dict) -> set[str]:
+    profile = workspace_account_payload(settings)
+    aliases = {
+        "me",
+        "我",
+        str(profile.get("display_name") or "").strip(),
+        str(profile.get("handle") or "").strip(),
+        str(profile.get("identity") or "").strip(),
+        str(settings.get("profile_display_name") or "").strip(),
+        str(settings.get("profile_handle") or "").strip(),
+    }
+    return {alias for alias in aliases if alias and alias not in {"未绑定账号", "@ayla.local"}}
+
+
+def capture_mentions_me(payload: dict, settings: dict) -> bool:
+    if truthy(payload.get("mentioned_me")):
+        return True
+    mentions = payload.get("mentions")
+    if isinstance(mentions, str):
+        mentions = re.split(r"[\n,，;；@\s]+", mentions)
+    if not isinstance(mentions, list):
+        return False
+    cleaned = [str(item).strip().lstrip("@") for item in mentions if str(item).strip()]
+    if not cleaned:
+        return False
+    aliases = capture_owner_aliases(settings)
+    return not aliases or any(item in aliases for item in cleaned)
+
+
+def capture_chat_matches(payload: dict, values: list[str]) -> bool:
+    chat_id = str(payload.get("chat_id") or payload.get("chatId") or "").strip()
+    chat_name = str(payload.get("chat_name") or payload.get("chatName") or payload.get("channel_name") or "").strip()
+    haystack = f"{chat_id}\n{chat_name}"
+    return text_matches_any(haystack, values)
+
+
+def is_noise_message(content: str) -> bool:
+    text = re.sub(r"\s+", "", str(content or ""))
+    if not text:
+        return True
+    if text in NOISE_PHRASES:
+        return True
+    if len(text) <= 3 and not URL_RE.search(text):
+        return True
+    return False
+
+
+def content_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def capture_budget_payload(settings: dict) -> dict:
+    return {
+        "daily_model_calls": clamp_int(settings.get("capture_daily_model_call_budget"), 24, 1, 500),
+        "daily_input_tokens": clamp_int(settings.get("capture_daily_token_budget"), 200000, 1000, 5_000_000),
+        "max_web_content_kb": clamp_int(settings.get("capture_max_web_content_kb"), 512, 1, 8192),
+        "raw_ttl_days": clamp_int(settings.get("capture_raw_ttl_days"), 14, 1, 90),
+        "batch_interval_minutes": clamp_int(settings.get("capture_batch_interval_minutes"), 15, 5, 240),
+        "hourly_pull_limit": clamp_int(settings.get("capture_hourly_pull_limit"), 500, 10, 10000),
+    }
+
+
+def trim_capture_content(settings: dict, source_type: str, content: str) -> tuple[str, bool, int, int]:
+    raw = str(content or "")
+    original_bytes = len(raw.encode("utf-8"))
+    if source_type not in {"browser_page", "browser_share", "feishu_doc_event"}:
+        return raw, False, original_bytes, original_bytes
+    max_bytes = capture_budget_payload(settings)["max_web_content_kb"] * 1024
+    if original_bytes <= max_bytes:
+        return raw, False, original_bytes, original_bytes
+    clipped = raw.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+    clipped = f"{clipped}\n\n[内容已按采集预算截断，保留来源链接用于回看]"
+    return clipped, True, original_bytes, len(clipped.encode("utf-8"))
+
+
+def write_raw_capture_content(source_type: str, source_id: str, content: str) -> str:
+    raw = str(content or "")
+    if not raw:
+        return ""
+    date_key = today_key()
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_id or hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16])
+    raw_dir = VAULT_ROOT / "private" / "raw_messages" / date_key
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path = raw_dir / f"{source_type}-{safe_id}.txt"
+    path.write_text(raw, encoding="utf-8")
+    return str(path)
+
+
+def cleanup_expired_raw_capture_content(settings: dict) -> dict:
+    raw_root = VAULT_ROOT / "private" / "raw_messages"
+    ttl_days = capture_budget_payload(settings)["raw_ttl_days"]
+    if not raw_root.exists():
+        return {"deleted_files": 0, "deleted_dirs": 0, "ttl_days": ttl_days}
+    cutoff = datetime.now().date() - timedelta(days=ttl_days)
+    deleted_files = 0
+    deleted_dirs = 0
+    for child in raw_root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            folder_date = datetime.strptime(child.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if folder_date >= cutoff:
+            continue
+        for file_path in child.iterdir():
+            if file_path.is_file():
+                file_path.unlink()
+                deleted_files += 1
+        try:
+            child.rmdir()
+            deleted_dirs += 1
+        except OSError:
+            pass
+    return {"deleted_files": deleted_files, "deleted_dirs": deleted_dirs, "ttl_days": ttl_days}
+
+
+def capture_rule_result(settings: dict, payload: dict) -> dict:
+    source_type = str(payload.get("source_type") or payload.get("source") or "").strip() or "manual_memo"
+    content = str(payload.get("content") or payload.get("raw_input") or payload.get("text") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    source_url = str(payload.get("source_url") or payload.get("url") or "").strip()
+    combined = "\n".join([title, content, source_url])
+    rules: list[str] = []
+    score = 0.0
+
+    important_chats = settings_text_list(settings, "capture_important_chats")
+    meego_chats = settings_text_list(settings, "capture_meego_bound_chats")
+    keywords = settings_text_list(settings, "capture_keywords")
+    allowlist = settings_text_list(settings, "browser_capture_allowlist")
+
+    capture_mode = str(settings.get("capture_mode") or "hybrid").strip().lower()
+    manual_share = source_type in MANUAL_CAPTURE_SOURCE_TYPES
+    if capture_mode == "manual_only" and source_type in PASSIVE_CAPTURE_SOURCE_TYPES and not manual_share:
+        ingest_threshold = setting_float(settings, "capture_ingest_threshold", 0.35, 0.0, 1.0)
+        model_threshold = setting_float(settings, "capture_model_threshold", 0.65, 0.0, 1.0)
+        summary_threshold = setting_float(settings, "capture_summary_threshold", 0.55, 0.0, 1.0)
+        return {
+            "importance_score": 0.0,
+            "rules": ["manual_only_filtered"],
+            "rule_matched": False,
+            "should_model": False,
+            "should_summarize": False,
+            "status": "manual_only_filtered",
+            "decision": "index_only",
+            "thresholds": {
+                "ingest": ingest_threshold,
+                "model": model_threshold,
+                "summary": summary_threshold,
+            },
+        }
+
+    if manual_share:
+        score += 0.7
+        rules.append("manual_share")
+
+    if source_type == "browser_page":
+        domain = source_domain(source_url)
+        if any(domain == item.lower() or domain.endswith(f".{item.lower()}") for item in allowlist):
+            score += 0.7
+            rules.append("allowlisted_domain")
+
+    if source_type == "feishu_message":
+        if capture_mentions_me(payload, settings):
+            score += 0.55
+            rules.append("mention_me")
+        if truthy(payload.get("authored_by_me")) or str(payload.get("direction") or "").lower() in {"outgoing", "sent"}:
+            score += 0.4
+            rules.append("authored_by_me")
+        if truthy(payload.get("reply_to_me")):
+            score += 0.45
+            rules.append("reply_to_me")
+        if str(payload.get("chat_type") or payload.get("message_type") or "").lower() in {"direct", "p2p", "single"}:
+            score += 0.55
+            rules.append("direct_chat")
+        if capture_chat_matches(payload, meego_chats):
+            score += 0.45
+            rules.append("meego_bound_chat")
+        if capture_chat_matches(payload, important_chats):
+            score += 0.25
+            rules.append("important_chat")
+
+    if any(word in combined.lower() for word in ACTION_SIGNAL_WORDS) or is_task_like(combined):
+        score += 0.25
+        rules.append("action_signal")
+    if is_risk_like(combined):
+        score += 0.2
+        rules.append("risk_signal")
+    if MEEGO_SIGNAL_RE.search(combined) or "meego" in combined.lower() or "需求" in combined:
+        score += 0.25
+        rules.append("meego_signal")
+    if URL_RE.search(combined):
+        score += 0.2
+        rules.append("link_signal")
+    if any(word in combined for word in ["技术方案", "会议纪要", "结论", "复盘", "文档"]):
+        score += 0.2
+        rules.append("knowledge_signal")
+    if text_matches_any(combined, keywords):
+        score += 0.15
+        rules.append("keyword_signal")
+    if is_noise_message(content) and not {"mention_me", "direct_chat", "meego_bound_chat"}.intersection(rules):
+        score = min(score, 0.1)
+        rules.append("noise_phrase")
+
+    score = min(1.0, round(score, 2))
+    ingest_threshold = setting_float(settings, "capture_ingest_threshold", 0.35, 0.0, 1.0)
+    model_threshold = setting_float(settings, "capture_model_threshold", 0.65, 0.0, 1.0)
+    summary_threshold = setting_float(settings, "capture_summary_threshold", 0.55, 0.0, 1.0)
+    should_model = score >= model_threshold
+    should_summarize = score >= summary_threshold
+    rule_matched = score >= ingest_threshold
+    status = "queued_for_batch" if should_model else "matched_index" if rule_matched else "noise"
+    return {
+        "importance_score": score,
+        "rules": rules,
+        "rule_matched": rule_matched,
+        "should_model": should_model,
+        "should_summarize": should_summarize,
+        "status": status,
+        "decision": "queue_for_batch" if should_model else "index_only",
+        "thresholds": {
+            "ingest": ingest_threshold,
+            "model": model_threshold,
+            "summary": summary_threshold,
+        },
+    }
+
+
+def capture_candidate_type(rule_result: dict, content: str, source_url: str) -> tuple[str, str]:
+    rules = set(rule_result.get("rules") or [])
+    if "action_signal" in rules or is_task_like(content):
+        return "task_candidate", "todo"
+    if source_url or {"link_signal", "knowledge_signal"}.intersection(rules):
+        return "report_material_candidate", "report_material"
+    return "work_record_candidate", "work_record"
+
+
+def capture_model_queue_count(conn: sqlite3.Connection, date_key: str | None = None) -> int:
+    date_key = date_key or today_key()
+    rows = [
+        row_to_dict(row)
+        for row in conn.execute(
+            """
+            SELECT metadata FROM source_events
+            WHERE substr(collected_at, 1, 10) = ?
+            """,
+            (date_key,),
+        ).fetchall()
+    ]
+    return sum(1 for row in rows if capture_event_for_health(row).get("should_model"))
+
+
+def ingest_source_event(conn: sqlite3.Connection, payload: dict) -> dict:
+    settings = get_settings(conn)
+    source_type = str(payload.get("source_type") or payload.get("source") or "manual_memo").strip() or "manual_memo"
+    content = str(payload.get("content") or payload.get("raw_input") or payload.get("text") or "").strip()
+    content, content_truncated, original_content_bytes, stored_content_bytes = trim_capture_content(settings, source_type, content)
+    title = str(payload.get("title") or "").strip() or title_from_content(content, "采集信号")
+    source_url = str(payload.get("source_url") or payload.get("url") or "").strip()
+    source_id = str(payload.get("source_id") or payload.get("message_id") or payload.get("event_id") or "").strip()
+    if not source_id:
+        source_id = f"{source_type}:{content_hash('|'.join([title, content, source_url]))[:24]}"
+    existing = existing_source_id(conn, source_type, source_id)
+    if existing:
+        return {"ok": True, "decision": "duplicate", "source_event_id": existing, "duplicate": True}
+
+    rule_result = capture_rule_result(settings, {**payload, "source_type": source_type, "content": content, "title": title, "source_url": source_url})
+    model_budget = capture_budget_payload(settings)["daily_model_calls"]
+    model_budget_used = capture_model_queue_count(conn)
+    if rule_result["should_model"] and model_budget_used >= model_budget:
+        rule_result = dict(rule_result)
+        rule_result["should_model"] = False
+        rule_result["should_summarize"] = False
+        rule_result["status"] = "budget_capped"
+        rule_result["decision"] = "index_only"
+        rule_result["budget_capped"] = True
+    raw_retained = bool(source_type in CAPTURE_SOURCE_TYPES and rule_result["rule_matched"])
+    raw_ref = write_raw_capture_content(source_type, source_id, content) if raw_retained else ""
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    capture_metadata = {
+        **rule_result,
+        "capture_mode": settings.get("capture_mode") or "hybrid",
+        "chat_id": str(payload.get("chat_id") or payload.get("chatId") or ""),
+        "chat_name": str(payload.get("chat_name") or payload.get("chatName") or ""),
+        "thread_id": str(payload.get("thread_id") or payload.get("threadId") or ""),
+        "message_id": str(payload.get("message_id") or source_id),
+        "content_hash": content_hash(content),
+        "raw_ref": raw_ref,
+        "raw_retained": raw_retained,
+        "raw_ttl_days": clamp_int(settings.get("capture_raw_ttl_days"), 14, 1, 90),
+        "content_truncated": content_truncated,
+        "original_content_bytes": original_content_bytes,
+        "stored_content_bytes": stored_content_bytes,
+        "max_content_bytes": capture_budget_payload(settings)["max_web_content_kb"] * 1024,
+        "model_budget": model_budget,
+        "model_budget_used": model_budget_used,
+        "budget_capped": bool(rule_result.get("budget_capped")),
+    }
+    metadata_payload = {
+        **metadata,
+        "capture": capture_metadata,
+        "source_payload": {
+            key: value
+            for key, value in payload.items()
+            if key not in {"content", "raw_input", "text", "metadata"}
+        },
+    }
+    stored_content = compact_text(content, 520) if rule_result["rule_matched"] else ""
+    event_id = create_source_event(
+        conn,
+        source_type,
+        title,
+        stored_content,
+        author=str(payload.get("author") or workspace_account_author(settings, "collector")),
+        source_url=source_url,
+        source_id=source_id,
+        metadata=metadata_payload,
+    )
+
+    inbox_item_id = ""
+    if rule_result["should_model"]:
+        item_type, candidate_type = capture_candidate_type(rule_result, content, source_url)
+        target = "todo" if item_type == "task_candidate" else "note"
+        inbox_metadata = {
+            "tags": ["采集降噪", source_type],
+            "auto_target": target,
+            "candidate_type": candidate_type,
+            "storage_target": "local_state",
+            "visibility": "internal" if source_type.startswith("feishu") else "private",
+            "risk_level": "medium" if is_risk_like(content) else "low",
+            "requires_confirmation": True,
+            "confirmation_policy": "instant_confirm" if item_type == "task_candidate" else "batch_confirm",
+            "source_url": source_url,
+            "source_refs": [source_id],
+            "review_date": today_key(),
+            "review_status": "pending",
+            "parser_provider": "rule_filter",
+            "parser_status": "queued_for_batch",
+            "capture": capture_metadata,
+        }
+        inbox_item_id = create_inbox_item(
+            conn,
+            event_id,
+            item_type,
+            title,
+            stored_content,
+            classify_text(f"{title}\n{content}"),
+            rule_result["importance_score"],
+            inbox_metadata,
+            status="自动分类",
+        )
+    audit(
+        conn,
+        "ingest_source_event",
+        "source_event",
+        event_id,
+        {"decision": rule_result["decision"], "score": rule_result["importance_score"], "rules": rule_result["rules"]},
+    )
+    return {
+        "ok": True,
+        "decision": rule_result["decision"],
+        "source_event_id": event_id,
+        "inbox_item_id": inbox_item_id,
+        "importance_score": rule_result["importance_score"],
+        "rules": rule_result["rules"],
+        "should_model": rule_result["should_model"],
+        "should_summarize": rule_result["should_summarize"],
+    }
+
+
+def capture_event_for_health(event: dict) -> dict:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    capture = metadata.get("capture") if isinstance(metadata.get("capture"), dict) else {}
+    return capture
+
+
+def source_capture_health(conn: sqlite3.Connection, date_key: str | None = None) -> dict:
+    date_key = date_key or today_key()
+    settings = get_settings(conn)
+    rows = [
+        row_to_dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM source_events
+            WHERE substr(collected_at, 1, 10) = ?
+            ORDER BY collected_at DESC
+            """,
+            (date_key,),
+        ).fetchall()
+    ]
+    capture_rows = [row for row in rows if row.get("source_type") in CAPTURE_SOURCE_TYPES or capture_event_for_health(row)]
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for row in capture_rows:
+        source_type = row.get("source_type") or "unknown"
+        by_type[source_type] = by_type.get(source_type, 0) + 1
+        status = str(capture_event_for_health(row).get("status") or "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+    rule_matched = sum(1 for row in capture_rows if capture_event_for_health(row).get("rule_matched"))
+    model_queued = sum(1 for row in capture_rows if capture_event_for_health(row).get("should_model"))
+    summary_ready = sum(1 for row in capture_rows if capture_event_for_health(row).get("should_summarize"))
+    filtered_noise = sum(1 for row in capture_rows if capture_event_for_health(row).get("status") in {"noise", "manual_only_filtered"})
+    return {
+        "date": date_key,
+        "received": len(capture_rows),
+        "rule_matched": rule_matched,
+        "model_queued": model_queued,
+        "model_understood": model_queued,
+        "summary_ready": summary_ready,
+        "filtered_noise": filtered_noise,
+        "index_only": max(0, len(capture_rows) - model_queued - filtered_noise),
+        "by_source_type": by_type,
+        "by_status": by_status,
+        "capture_mode": str(settings.get("capture_mode") or "hybrid"),
+        "budget": capture_budget_payload(settings),
+    }
+
+
+def source_capture_evidence_payload(conn: sqlite3.Connection, date_key: str | None = None, limit: int = 12) -> list[dict]:
+    date_key = date_key or today_key()
+    rows = [
+        row_to_dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM source_events
+            WHERE substr(collected_at, 1, 10) = ?
+            ORDER BY collected_at DESC
+            LIMIT 300
+            """,
+            (date_key,),
+        ).fetchall()
+    ]
+    evidence = []
+    for row in rows:
+        capture = capture_event_for_health(row)
+        if not capture or not (capture.get("should_summarize") or capture.get("should_model")):
+            continue
+        if capture.get("status") in {"noise", "manual_only_filtered"}:
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        payload = metadata.get("source_payload") if isinstance(metadata.get("source_payload"), dict) else {}
+        chat_name = str(capture.get("chat_name") or payload.get("chat_name") or payload.get("chatName") or "").strip()
+        rules = capture.get("rules") if isinstance(capture.get("rules"), list) else []
+        evidence.append(
+            {
+                "id": row.get("id"),
+                "source_type": row.get("source_type"),
+                "source_id": row.get("source_id"),
+                "source_url": row.get("source_url") or "",
+                "title": row.get("title") or row.get("source_type") or "采集来源",
+                "summary": compact_text(row.get("content") or "", 180),
+                "chat_id": capture.get("chat_id") or payload.get("chat_id") or "",
+                "chat_name": chat_name,
+                "thread_id": capture.get("thread_id") or "",
+                "message_id": capture.get("message_id") or row.get("source_id") or "",
+                "importance_score": capture.get("importance_score") or 0,
+                "matched_rules": rules,
+                "status": capture.get("status") or "",
+                "collected_at": row.get("collected_at") or row.get("created_at"),
+                "evidence_label": chat_name or row.get("source_type") or "来源",
+            }
+        )
+    evidence.sort(key=lambda item: (float(item.get("importance_score") or 0), str(item.get("collected_at") or "")), reverse=True)
+    return evidence[:limit]
+
+
 def parse_lark_datetime(value: object) -> datetime | None:
     text = format_lark_time(value)
     if not text:
@@ -4094,8 +4643,10 @@ def ensure_daily_rollover(conn: sqlite3.Connection) -> dict:
             "last_refresh_at": str(settings.get("last_daily_rollover_at") or ""),
             "next_refresh_at": next_daily_refresh_at(),
             "materialized_defaults": {"todo": 0, "note": 0, "skipped": 0},
+            "raw_cleanup": {"deleted_files": 0, "deleted_dirs": 0, "ttl_days": capture_budget_payload(settings)["raw_ttl_days"]},
         }
     materialized_defaults = materialize_ai_summary_defaults(conn)
+    raw_cleanup = cleanup_expired_raw_capture_content(settings)
     refreshed_at = now_iso()
     save_settings_values(
         conn,
@@ -4111,6 +4662,7 @@ def ensure_daily_rollover(conn: sqlite3.Connection) -> dict:
         "last_refresh_at": refreshed_at,
         "next_refresh_at": next_daily_refresh_at(),
         "materialized_defaults": materialized_defaults,
+        "raw_cleanup": raw_cleanup,
     }
     # 自然日切换只标记工作台进入新的一天，具体看板内容仍由当天查询实时生成。
     audit(conn, "daily_rollover", "daily_workbench", today, result)
@@ -5047,10 +5599,19 @@ def agent_context_payload(conn: sqlite3.Connection, scenario: str = "global", pr
         if task.get("project_id"):
             projects.add(task["project_id"])
     memory_payload = agent_memory_context(conn, scenario, project)
+    settings = get_settings(conn)
     return {
         "workspace": "Ayla personal agent workspace",
         "today": today_key(),
         "entrypoints": ["feishu_bot", "local_web", "browser_share", "file_drop"],
+        "source_event_endpoint": "POST /api/source-events",
+        "source_capture": {
+            "mode": settings.get("capture_mode"),
+            "important_chats": settings_text_list(settings, "capture_important_chats"),
+            "meego_bound_chats": settings_text_list(settings, "capture_meego_bound_chats"),
+            "budget": capture_budget_payload(settings),
+            "health": source_capture_health(conn),
+        },
         "categories": sorted(set([*PUBLIC_CATEGORY_DIRS.keys(), *LOCAL_STATE_CATEGORY_DIRS.keys()])),
         "storage_targets": ["local_state", "feishu_doc", "obsidian_public_vault"],
         "visibility": ["private", "internal", "public"],
@@ -5513,12 +6074,15 @@ def daily_archive_payload(conn: sqlite3.Connection, date_key: str | None = None)
             (date_key, date_key),
         ).fetchall()
     ]
-    memo_events = [
-        event
-        for event in events
-        if event.get("source_type") in ["manual_memo", "web_memo", "lark_doc_memo", "local_web_model_cli", "feishu_summary_mock"]
-        and not source_event_hidden(event)
-    ]
+    memo_source_types = {"manual_memo", "web_memo", "lark_doc_memo", "local_web_model_cli", "feishu_summary_mock"}
+    memo_events = []
+    for event in events:
+        if source_event_hidden(event):
+            continue
+        source_type = event.get("source_type")
+        capture = capture_event_for_health(event)
+        if source_type in memo_source_types or (source_type in CAPTURE_ARCHIVE_SOURCE_TYPES and capture.get("rule_matched")):
+            memo_events.append(event)
     auto_archived = [
         item
         for item in inbox
@@ -5566,32 +6130,19 @@ def generate_daily_report(conn: sqlite3.Connection, date_key: str | None = None)
     ]
     active = [task for task in tasks if active_task(task)]
     done = [task for task in tasks if task.get("status") == "已完成"]
-    pending = archive["adjustable"]
     lines = [
-        f"{date_key} 每日整理日报",
-        "",
         f"- 今日备忘归档：{archive['counts']['events']} 条输入，{archive['counts']['auto_archived']} 条已处理，{archive['counts']['adjustable']} 条待调整。",
         f"- 今日 TODO：{len(active)} 条未完成，{len(done)} 条已完成。",
+        "",
+        "待跟进 TODO：",
     ]
     if active:
-        lines.append("")
-        lines.append("待跟进 TODO：")
         for task in active[:8]:
             due = f"（截止 {task['due_at']}）" if task.get("due_at") else ""
             project = f" [{task['project_id']}]" if task.get("project_id") else ""
             lines.append(f"- {task['title']}{project}{due}")
-    if pending:
-        lines.append("")
-        lines.append("需要人工调整：")
-        for item in pending[:8]:
-            metadata = item.get("metadata") or {}
-            target = metadata.get("auto_target") or item.get("item_type")
-            lines.append(f"- {item['title']} -> {target}")
-    if archive["events"]:
-        lines.append("")
-        lines.append("今日输入摘要：")
-        for event in archive["events"][:6]:
-            lines.append(f"- {event.get('title') or event.get('source_type')}")
+    else:
+        lines.append("- 暂无")
     return "\n".join(lines)
 
 
@@ -5978,6 +6529,8 @@ def state_payload(conn: sqlite3.Connection) -> dict:
     settings = get_settings(conn)
     daily_archive = daily_archive_payload(conn, today)
     today_work_log = get_daily_work_log(conn, today)
+    source_capture = source_capture_health(conn, today)
+    source_evidence = source_capture_evidence_payload(conn, today)
     stats = {
         "pending_inbox": sum(1 for item in inbox if item["status"] in ["待确认", "未处理", "需补充", "自动分类"]),
         "today_tasks": sum(1 for task in tasks if task["status"] not in ["已完成", "已取消", "已归档"]),
@@ -6003,6 +6556,8 @@ def state_payload(conn: sqlite3.Connection) -> dict:
         "daily_review": daily_review_payload(conn),
         "daily_archive": daily_archive,
         "today_work_log": today_work_log,
+        "source_capture_health": source_capture,
+        "source_capture_evidence": source_evidence,
         "audit_logs": audit_rows,
         "agent_runs": agent_runs,
         "confirmations": confirmations,
@@ -6016,9 +6571,26 @@ def state_payload(conn: sqlite3.Connection) -> dict:
 
 class AgentHandler(BaseHTTPRequestHandler):
     server_version = "AylaAgentMVP/0.1"
+    allowed_origins: list[str] = []
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def cors_origin(self) -> str:
+        origin = self.headers.get("Origin", "").strip()
+        if not cors_origin_allowed(origin, self.allowed_origins):
+            return ""
+        return "*" if "*" in self.allowed_origins else origin
+
+    def end_headers(self) -> None:
+        origin = self.cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Ayla-Agent-Token")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+        super().end_headers()
 
     def send_json(self, payload: dict | list, status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -6054,6 +6626,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             return True
         self.send_error_json("invalid agent token", HTTPStatus.UNAUTHORIZED)
         return False
+
+    def do_OPTIONS(self) -> None:
+        parsed = urlparse(self.path)
+        origin = self.headers.get("Origin", "").strip()
+        if parsed.path.startswith("/api/") and origin and not self.cors_origin():
+            self.send_response(HTTPStatus.FORBIDDEN)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -6171,6 +6755,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                     if not self.ensure_agent_auth(conn):
                         return
                     result = agent_ingest(conn, payload)
+                    conn.commit()
+                    self.send_json(result, HTTPStatus.CREATED)
+                    return
+                if parsed.path == "/api/source-events":
+                    if not self.ensure_agent_auth(conn):
+                        return
+                    result = ingest_source_event(conn, payload)
                     conn.commit()
                     self.send_json(result, HTTPStatus.CREATED)
                     return
@@ -6338,8 +6929,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the personal Agent MVP workspace.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5173)
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help="Origin allowed to call Ayla APIs from browsers. Can be repeated; also reads AYLA_ALLOWED_ORIGINS.",
+    )
     args = parser.parse_args()
     init_db()
+    AgentHandler.allowed_origins = [
+        *split_env_list(os.environ.get("AYLA_ALLOWED_ORIGINS", "")),
+        *(args.allowed_origin or []),
+    ]
     server = ThreadingHTTPServer((args.host, args.port), AgentHandler)
     print(f"Ayla personal Agent MVP running at http://{args.host}:{args.port}")
     try:

@@ -89,6 +89,13 @@ class AylaDailyWorkbenchTests(unittest.TestCase):
         self.assertTrue(payload["next_daily_refresh_at"].startswith(tomorrow))
         self.assertEqual([item["id"] for item in payload["link_summaries"]], ["event_today"])
         self.assertEqual([event["id"] for event in payload["daily_archive"]["events"]], ["event_today"])
+        report = payload["today_work_log"]["generated_report"]
+        self.assertIn("今日备忘归档", report)
+        self.assertIn("今日 TODO", report)
+        self.assertIn("待跟进 TODO", report)
+        self.assertNotIn("每日整理日报", report)
+        self.assertNotIn("需要人工调整", report)
+        self.assertNotIn("今日输入摘要", report)
 
 
 if __name__ == "__main__":

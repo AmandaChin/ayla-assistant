@@ -27,6 +27,7 @@
 - OpenClaw Agent 可通过带 Token 的 `/api/agent/context` 和 `/api/agent/ingest` 把飞书 Bot 整理结果同步到今日增量整理。
 - 个人设置支持工作账号绑定：通过 `lark-cli auth login` 的 Device Flow 生成扫码授权，绑定后工作台 profile、SourceEvent owner、TODO assignee 和 Markdown frontmatter 会落到授权人的真实飞书身份。
 - 飞书数据源适配：通过本机 `lark-cli` 只读同步日历和妙记，自动落入 `SourceEvent`、收件箱候选和确认队列。
+- 飞书与网页采集降噪：新增 `SourceEvent` 规则打分、重点群 / Meego 绑定群 / 关键词配置、每日模型与 Token 预算、原文私密缓存 TTL、采集健康度和来源证据。
 - 快速备忘可切换到 `model_cli` 整理引擎，优先调用本机 `codex exec` 或 `claude -p` 输出 candidates，失败时自动回退本地规则。
 - 确认内容写入 Obsidian 兼容 Markdown。
 - 知识库笔记删除，会同步删除本地 Markdown 文件。
@@ -38,6 +39,8 @@
 ```bash
 ./ayla install --force
 ```
+
+首次安装会自动初始化本地数据目录，创建 `AgentMemory`、`LocalWorkState`、`PublicKnowledgeVault`、SQLite 数据库和 `system/init.json` 初始化记录。
 
 安装后会生成：
 
@@ -128,7 +131,32 @@ ayla open
 python3 server.py --host 127.0.0.1 --port 5173
 ```
 
-开发模式会继续使用仓库内的 `agent-vault/`。Mac App 模式会通过 `AYLA_HOME` 把个人数据写到 `~/Library/Application Support/Ayla/data/`。
+远端飞书 Bot 调用本机 Ayla 时，Core 需要监听内网地址或由安全 relay / 隧道转发。开发态可以显式开放监听地址：
+
+```bash
+AYLA_ALLOWED_ORIGINS=https://your-bot-console.example.com \
+python3 server.py --host 0.0.0.0 --port 5173
+```
+
+服务端到服务端调用只需要网络可达和 `X-Ayla-Agent-Token`；`AYLA_ALLOWED_ORIGINS` 只用于浏览器跨域预检。Mac App 模式默认仍只监听 `127.0.0.1`，如确需开放远端 API，可在更新安装后用 `AYLA_HOST=0.0.0.0 ayla open` 启动，并优先放在内网/VPN/隧道后面，不建议直接暴露整个工作台到公网。
+
+开发模式会继续使用仓库内的 `agent-vault/`。首次启动前也可以显式初始化一次：
+
+```bash
+python3 scripts/init_ayla_workspace.py
+```
+
+或使用 CLI：
+
+```bash
+./ayla init --development
+```
+
+Mac App 模式会通过 `AYLA_HOME` 把个人数据写到 `~/Library/Application Support/Ayla/data/`。如果需要手动初始化安装态数据目录：
+
+```bash
+ayla init
+```
 
 ## 本地数据
 
@@ -172,7 +200,17 @@ agent-vault/
     database.sqlite
 ```
 
-其中 `agent-vault/` 已写入 `.gitignore`，用于存放开发态个人数据、SQLite 数据库和生成的 Markdown 笔记，不上传到 GitHub。正式 Mac App 安装后的数据默认不写入仓库，而是写入 `~/Library/Application Support/Ayla/data/`。
+其中 `agent-vault/` 已写入 `.gitignore`，用于存放开发态个人数据、SQLite 数据库和生成的 Markdown 笔记，不上传到 GitHub。正式 Mac App 安装后的数据默认不写入仓库，而是写入 `~/Library/Application Support/Ayla/data/`。初始化结果会记录在对应数据目录的 `system/init.json`，例如开发态是：
+
+```text
+agent-vault/system/init.json
+```
+
+安装态是：
+
+```text
+~/Library/Application Support/Ayla/data/system/init.json
+```
 
 ## MVP 流程
 
@@ -263,11 +301,32 @@ POST /api/connectors/lark/bind/claim
 
 同步结果默认只写本地工作台，不会写回飞书。日历会生成 `work_record_candidate`，妙记会生成 `report_material_candidate`，都需要在今日整理或收件箱里确认后才进入本地工作库。
 
+## 飞书与网页采集降噪
+
+第一版不做全量群聊入库。采集入口统一写 `SourceEvent` 索引，再由规则层决定是否进入候选池：
+
+```text
+FeishuCollector / BrowserShare
+→ SourceEvent 轻量索引
+→ RuleFilter（@我、单聊、重点群、Meego、行动词、链接、资料词）
+→ InboxItem 候选 / 今日来源证据
+→ 今日整理、TODO 或本地工作库
+```
+
+默认混合模式是：`@我 / 单聊 / 极重要群` 走实时高信号，Meego 绑定群和普通重点群适合小时级抽取，普通群和普通网页只在主动分享时进入 Ayla。事件写入接口是：
+
+```text
+POST /api/source-events
+Authorization: Bearer <agent_api_token>
+```
+
+设置中心的「采集降噪」可配置重点群、Meego 绑定群、行动词、网页允许域名、入库 / 模型 / 总结阈值、每日模型调用次数、每日输入 Token、网页正文最大 KB、原文 TTL 和小时拉取上限。今日看板会展示接收数、规则命中数、进入理解数、过滤噪音数，并在 AI 智能总结里只展示命中规则后的来源证据。
+
 ## 后续开发方向
 
 - 将当前 AppKit/WKWebView 客户端继续增强为菜单栏、全局快捷键、通知和登录项完整体验，CLI 命令和本地数据目录保持兼容。
 - 将当前 SQLite 表结构固化为迁移脚本。
-- 增加真实飞书群聊采集、摘要和 TODO 抽取。
+- 增加真实飞书群聊长连接 / 小时抽取 Connector，并把候选池接入真实批处理摘要和 TODO 抽取。
 - 将当前本地网页解析器替换或增强为 MCP 文档解析器和真实 AI 摘要模型。
 - 将 `openclaw-workspace-writer.md` 中的 HTTP 调用封装成正式 OpenClaw skill 或 MCP server。
 - 增加脱敏检测、发布目录和 GitHub 同步。

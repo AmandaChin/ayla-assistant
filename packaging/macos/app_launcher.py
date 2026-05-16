@@ -14,7 +14,17 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 
-HOST = "127.0.0.1"
+DEFAULT_HOST = "127.0.0.1"
+
+
+def listen_host() -> str:
+    return os.environ.get("AYLA_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
+
+
+def local_url_host(host: str) -> str:
+    if host in {"0.0.0.0", "::"}:
+        return DEFAULT_HOST
+    return host
 
 
 def now_iso() -> str:
@@ -48,9 +58,9 @@ def state_path() -> Path:
     return runtime_root() / "core-state.json"
 
 
-def find_free_port() -> int:
+def find_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((HOST, 0))
+        sock.bind((host, 0))
         return int(sock.getsockname()[1])
 
 
@@ -116,13 +126,15 @@ def start_core() -> dict:
     data_root().mkdir(parents=True, exist_ok=True)
     logs_root().mkdir(parents=True, exist_ok=True)
 
-    port = find_free_port()
-    url = f"http://{HOST}:{port}"
+    host = listen_host()
+    port = find_free_port(host)
+    url = f"http://{local_url_host(host)}:{port}"
+    listen_url = f"http://{host}:{port}"
     log_path = logs_root() / "core.log"
     env = os.environ.copy()
     env["AYLA_HOME"] = str(data_root())
     env["AYLA_INSTALL_ROOT"] = str(install_root())
-    command = [sys.executable, str(app_root() / "server.py"), "--host", HOST, "--port", str(port)]
+    command = [sys.executable, str(app_root() / "server.py"), "--host", host, "--port", str(port)]
     log_file = log_path.open("a", encoding="utf-8")
     process = subprocess.Popen(
         command,
@@ -134,9 +146,11 @@ def start_core() -> dict:
     )
     state = {
         "pid": process.pid,
-        "host": HOST,
+        "host": host,
         "port": port,
         "url": url,
+        "listen_url": listen_url,
+        "remote_api_enabled": host not in {DEFAULT_HOST, "localhost"},
         "started_at": now_iso(),
         "install_root": str(install_root()),
         "app_root": str(app_root()),

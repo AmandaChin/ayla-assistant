@@ -449,6 +449,38 @@ function policyLabel(policy) {
   return labels[policy] || policy || "批量确认";
 }
 
+function captureModeLabel(mode) {
+  const labels = {
+    hybrid: "混合模式",
+    realtime: "实时高信号",
+    hourly: "小时抽取",
+    manual_only: "仅手动",
+  };
+  return labels[mode] || mode || "混合模式";
+}
+
+function captureRuleLabel(rule) {
+  const labels = {
+    mention_me: "@我",
+    authored_by_me: "我发出",
+    reply_to_me: "回复我",
+    direct_chat: "单聊",
+    meego_bound_chat: "Meego 群",
+    important_chat: "重点群",
+    action_signal: "行动词",
+    risk_signal: "风险",
+    meego_signal: "需求",
+    link_signal: "链接",
+    knowledge_signal: "资料",
+    keyword_signal: "关键词",
+    manual_share: "主动分享",
+    allowlisted_domain: "允许域名",
+    noise_phrase: "低信息",
+    manual_only_filtered: "仅手动",
+  };
+  return labels[rule] || rule || "规则";
+}
+
 function confidence(item) {
   return `${Math.round((Number(item.confidence) || 0) * 100)}%`;
 }
@@ -729,6 +761,7 @@ function latestEventsByType(type, limit = 3) {
 function renderDailyBriefCard() {
   const review = state.data.daily_review || {};
   const archive = state.data.daily_archive || { counts: {} };
+  const capture = state.data.source_capture_health || {};
   const calendarEvents = latestEventsByType("lark_calendar", 3);
   const minutesEvents = latestEventsByType("lark_minutes", 2);
   const activeTasks = todayRelevantTasks().filter(isActiveTask);
@@ -765,6 +798,19 @@ function renderDailyBriefCard() {
           </div>
         </section>
         <section class="overview-block">
+          <h4>采集健康度</h4>
+          <div class="metric-grid mini">
+            <div><strong>${capture.received || 0}</strong><span>接收</span></div>
+            <div><strong>${capture.rule_matched || 0}</strong><span>命中</span></div>
+            <div><strong>${capture.model_understood || capture.model_queued || 0}</strong><span>理解</span></div>
+            <div><strong>${capture.filtered_noise || 0}</strong><span>过滤</span></div>
+          </div>
+          <div class="meta-line">
+            ${metaPill(captureModeLabel(capture.capture_mode), capture.capture_mode === "manual_only" ? "amber" : "green")}
+            ${metaPill(`预算 ${capture.budget?.daily_model_calls || 0} 次`, "violet")}
+          </div>
+        </section>
+        <section class="overview-block">
           <h4>飞书日程</h4>
           <div class="brief-list">
             ${calendarEvents.length ? calendarEvents.map((event) => `
@@ -794,7 +840,8 @@ function renderDailyBriefCard() {
 function renderAiSummaryCard() {
   const log = state.data.today_work_log || {};
   const archive = state.data.daily_archive || { adjustable: [] };
-  const pendingInbox = (state.data.inbox || []).filter((item) => isTodayRecord(item) && !["已确认", "已忽略", "已归档", "已发布"].includes(item.status));
+  const capture = state.data.source_capture_health || {};
+  const captureEvidence = (state.data.source_capture_evidence || []).slice(0, 4);
   const recentRuns = (state.data.agent_runs || []).filter(isTodayRecord);
   const lead = log.summary || log.generated_report || "今天的输入会被整理成候选、TODO 和本地工作沉淀，等待你确认。";
   const knownTodos = todayRelevantTasks().filter(isActiveTask).slice(0, 2);
@@ -804,7 +851,7 @@ function renderAiSummaryCard() {
       <div class="card-header">
         <div class="card-title">
           <h3>AI 智能总结</h3>
-          <span>聚合今日输入、AgentRun、TODO 与飞书线索</span>
+          <span>只读取命中规则后的候选池，不直接吃全量群聊</span>
         </div>
         <span class="pill green">Ayla Daily</span>
       </div>
@@ -820,9 +867,33 @@ function renderAiSummaryCard() {
             <p>${escapeHtml(recentRuns[0]?.candidate_output?.summary || "暂无新的 AgentRun 摘要")}</p>
           </article>
           <article class="ai-summary-item">
-            <header><strong>确认队列</strong>${metaPill(`${pendingInbox.length} 条`, pendingInbox.length ? "amber" : "green")}</header>
-            <p>${escapeHtml(pendingInbox.slice(0, 3).map((item) => item.title).join(" / ") || "确认队列清空")}</p>
+            <header><strong>采集候选</strong>${metaPill(`${capture.rule_matched || 0} 条命中`, capture.rule_matched ? "green" : "")}</header>
+            <p>${escapeHtml(`接收 ${capture.received || 0} 条，进入理解 ${capture.model_understood || capture.model_queued || 0} 条，过滤噪音 ${capture.filtered_noise || 0} 条`)}</p>
           </article>
+        </section>
+        <section class="ai-zone">
+          <div class="ai-zone-head">
+            <div><h4>来源证据</h4><span>群消息 / 文档 / 网页只展示已命中规则的来源</span></div>
+            <span class="pill">Evidence</span>
+          </div>
+          <div class="ai-action-list">
+            ${captureEvidence.length ? captureEvidence.map((item) => `
+              <article class="ai-action-item">
+                <div class="ai-action-main">
+                  <div>
+                    <strong>${escapeHtml(item.title || item.evidence_label || "采集来源")}</strong>
+                    <p>${escapeHtml(summaryPreview(item.summary, 180) || item.evidence_label || "已保留来源索引")}</p>
+                  </div>
+                  ${sourceLink(item.source_url)}
+                </div>
+                <div class="meta-line">
+                  ${metaPill(item.evidence_label || item.source_type || "来源", "green")}
+                  ${metaPill(`分 ${Math.round(Number(item.importance_score || 0) * 100)}`)}
+                  ${(item.matched_rules || []).slice(0, 4).map((rule) => metaPill(captureRuleLabel(rule), rule === "noise_phrase" ? "amber" : "violet")).join("")}
+                </div>
+              </article>
+            `).join("") : `<div class="empty-hint">暂无命中规则的来源证据</div>`}
+          </div>
         </section>
         <section class="ai-zone">
           <div class="ai-zone-head">
@@ -968,6 +1039,7 @@ function renderWorkspaceHero() {
   const archive = state.data.daily_archive || { counts: {} };
   const review = state.data.daily_review || {};
   const modelStatus = state.data.model_cli_status || {};
+  const capture = state.data.source_capture_health || {};
   return `
     <section class="workspace-hero">
       <div>
@@ -979,6 +1051,7 @@ function renderWorkspaceHero() {
           ${metaPill(`${stats.today_tasks || 0} 个未完成 TODO`, "green")}
           ${metaPill(`${archive.counts?.events || 0} 条今日备忘`)}
           ${metaPill(`${review.today_count || 0} 条今日待整理`, review.today_count ? "amber" : "")}
+          ${metaPill(`采集 ${capture.rule_matched || 0}/${capture.received || 0}`, capture.rule_matched ? "green" : "")}
           ${metaPill(modelStatus.enabled ? "模型整理" : "本地规则", modelStatus.enabled ? "green" : "")}
         </div>
       </div>
@@ -2460,6 +2533,48 @@ function renderSettings() {
                 <button class="jump-button" data-action="check-lark" type="button">检查连接</button>
                 <button class="jump-button primary" data-action="sync-lark-today" type="button">同步今天</button>
                 <button class="jump-button" data-action="sync-lark-range" type="button">同步近 ${escapeHtml(syncDays)} 天</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="card settings-card span-6">
+            <div class="card-header">
+              <div class="card-title"><h3>采集降噪</h3><span>三档采集、规则阈值和每日预算</span></div>
+              ${metaPill(captureModeLabel(settings.capture_mode), settings.capture_mode === "manual_only" ? "amber" : "green")}
+            </div>
+            <div class="settings-fields">
+              <div class="inline-fields">
+                <label>采集模式
+                  <select class="select-input" name="capture_mode">
+                    ${[
+                      ["hybrid", "混合：@我实时，重点群小时抽取"],
+                      ["realtime", "实时：只接高价值信号"],
+                      ["hourly", "小时抽取：按规则批量筛选"],
+                      ["manual_only", "仅手动：分享/复制链接才入库"],
+                    ].map(([value, label]) => `<option value="${value}" ${value === (settings.capture_mode || "hybrid") ? "selected" : ""}>${label}</option>`).join("")}
+                  </select>
+                </label>
+                <label>批处理间隔
+                  <input class="text-input" name="capture_batch_interval_minutes" type="number" min="5" max="240" value="${escapeHtml(settings.capture_batch_interval_minutes || 15)}" />
+                </label>
+              </div>
+              <label>重点群 / chat_id / 关键词<textarea class="textarea compact-textarea" name="capture_important_chats">${escapeHtml(settings.capture_important_chats || "")}</textarea></label>
+              <label>Meego 绑定群<textarea class="textarea compact-textarea" name="capture_meego_bound_chats">${escapeHtml(settings.capture_meego_bound_chats || "")}</textarea></label>
+              <label>行动词 / 资料词<textarea class="textarea compact-textarea" name="capture_keywords">${escapeHtml(settings.capture_keywords || "")}</textarea></label>
+              <label>网页允许域名<textarea class="textarea compact-textarea" name="browser_capture_allowlist">${escapeHtml(settings.browser_capture_allowlist || "")}</textarea></label>
+              <div class="inline-fields">
+                <label>入库阈值<input class="text-input" name="capture_ingest_threshold" type="number" min="0" max="1" step="0.05" value="${escapeHtml(settings.capture_ingest_threshold || 0.35)}" /></label>
+                <label>模型阈值<input class="text-input" name="capture_model_threshold" type="number" min="0" max="1" step="0.05" value="${escapeHtml(settings.capture_model_threshold || 0.65)}" /></label>
+                <label>总结阈值<input class="text-input" name="capture_summary_threshold" type="number" min="0" max="1" step="0.05" value="${escapeHtml(settings.capture_summary_threshold || 0.55)}" /></label>
+              </div>
+              <div class="inline-fields">
+                <label>模型调用/日<input class="text-input" name="capture_daily_model_call_budget" type="number" min="1" max="500" value="${escapeHtml(settings.capture_daily_model_call_budget || 24)}" /></label>
+                <label>Token/日<input class="text-input" name="capture_daily_token_budget" type="number" min="1000" value="${escapeHtml(settings.capture_daily_token_budget || 200000)}" /></label>
+                <label>网页 KB<input class="text-input" name="capture_max_web_content_kb" type="number" min="1" max="8192" value="${escapeHtml(settings.capture_max_web_content_kb || 512)}" /></label>
+              </div>
+              <div class="inline-fields">
+                <label>原文 TTL 天<input class="text-input" name="capture_raw_ttl_days" type="number" min="1" max="90" value="${escapeHtml(settings.capture_raw_ttl_days || 14)}" /></label>
+                <label>小时拉取上限<input class="text-input" name="capture_hourly_pull_limit" type="number" min="10" max="10000" value="${escapeHtml(settings.capture_hourly_pull_limit || 500)}" /></label>
               </div>
             </div>
           </article>

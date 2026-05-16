@@ -19,6 +19,15 @@ ayla status
 
 开发模式才固定使用 `http://127.0.0.1:5173`。
 
+远端 Bot 不能访问你本机的 `127.0.0.1`。如果 Bot 部署在远端，需要先让 Ayla Core 通过内网、VPN、隧道或 relay 暴露一个远端可达的 HTTPS 地址，再把它写成 `AYLA_BASE_URL`。开发态可这样启动远端 API：
+
+```bash
+AYLA_ALLOWED_ORIGINS=https://your-bot-console.example.com \
+python3 server.py --host 0.0.0.0 --port 5173
+```
+
+服务端到服务端调用不依赖 CORS，只要带 Token 即可；`AYLA_ALLOWED_ORIGINS` 只用于浏览器跨域调用。不要把整个工作台裸露到公网，建议只在反向代理层放行 `/api/source-events`、`/api/agent/ingest` 和 `/api/agent/context`。
+
 写入接口需要 Token。Token 可在工作台「设置中心 → OpenClaw 写入 Token」复制。
 
 ## 2. 获取上下文
@@ -170,7 +179,73 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
   --dry-run
 ```
 
-## 6. Agent Prompt 建议
+## 6. 远端 Bot 文件中转：Ayla Drop v1
+
+如果 OpenClaw / 飞书 Bot 部署在远端，且不想把本机 Ayla API 暴露到公网，使用文件中转协议。远端 Bot 按天写入聊天 JSON，本地 Ayla importer 后续定时扫描。
+
+目录约定：
+
+```text
+agent-vault/
+  DropBox/
+    feishu-chat/
+      incoming/YYYY-MM-DD/*.json
+      processed/YYYY-MM-DD/*.json
+      failed/YYYY-MM-DD/*.json
+      tmp/
+```
+
+安装态目录：
+
+```text
+~/Library/Application Support/Ayla/data/DropBox/feishu-chat/
+```
+
+文件名：
+
+```text
+{YYYYMMDD}T{HHmmss}-{producer_id}-{chat_id_or_mix}-{batch_id}.json
+```
+
+写入方要求：
+
+- 先写 `tmp/`，完成后原子 rename 到 `incoming/YYYY-MM-DD/`。
+- 使用“按天目录 + 小批量 JSON 文件”，不要追加同一个全天大 JSON。
+- 每条消息必须带稳定 `message_id` 或 `idempotency_key`。
+- 不写 token、cookie、密钥、会话凭证。
+- 不移动 `processed/` 或 `failed/`，这些目录归 Ayla importer 管。
+
+机器契约：
+
+```text
+agents/orchestrator/schemas/feishu-chat-daily-drop.schema.json
+```
+
+样例：
+
+```text
+agents/orchestrator/examples/feishu-chat-daily-drop.example.json
+```
+
+最小顶层结构：
+
+```json
+{
+  "schema_version": "ayla.feishu_chat.daily.v1",
+  "kind": "feishu_chat_daily_batch",
+  "date": "2026-05-16",
+  "batch_id": "openclaw-workbot-20260516-225000-001",
+  "idempotency_key": "openclaw-workbot:2026-05-16:batch001",
+  "created_at": "2026-05-16T22:50:00+08:00",
+  "producer": {
+    "type": "feishu_bot",
+    "name": "openclaw-workbot"
+  },
+  "messages": []
+}
+```
+
+## 7. Agent Prompt 建议
 
 可以在 OpenClaw Agent 的系统提示中加入：
 
@@ -191,7 +266,7 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 12. 回复用户一句简短确认：已放入待确认队列，并说明归类结果。
 ```
 
-## 7. MVP 部署建议
+## 8. MVP 部署建议
 
 第一版建议 OpenClaw 和 Ayla 工作台都跑在同一台 Mac：
 
@@ -202,9 +277,9 @@ python3 agents/orchestrator/scripts/orchestrator_cli.py ingest \
 → Ayla 工作台今日增量整理
 ```
 
-如果 OpenClaw 跑在远端服务器，服务器不能直接访问本机 `127.0.0.1`，需要改成云端 relay、内网穿透，或让工作台主动轮询远端结果。
+如果 OpenClaw 跑在远端服务器，服务器不能直接访问本机 `127.0.0.1`，需要改成云端 relay、内网穿透，或采用上面的 Ayla Drop v1 文件中转，让工作台主动轮询远端结果。
 
-## 8. 本地 model_cli adapter
+## 9. 本地 model_cli adapter
 
 工作台自己的「快速备忘」也可以直接桥接真实模型。设置中心里将「整理引擎」改为 `真实模型 CLI` 后，`/api/memos` 会优先调用本机模型命令：
 

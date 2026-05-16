@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -155,6 +156,10 @@ def data_root(install_root: Path) -> Path:
     return install_root / "data"
 
 
+def init_metadata_path(root: Path) -> Path:
+    return root / "system" / "init.json"
+
+
 def load_metadata(install_root: Path) -> dict:
     path = metadata_path(install_root)
     if not path.exists():
@@ -166,6 +171,59 @@ def write_metadata(install_root: Path, metadata: dict) -> None:
     path = metadata_path(install_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def initialize_workspace(*, source_root: Path, data_root: Path, mode: str = "install") -> dict:
+    source_root = source_root.expanduser().resolve()
+    data_root = data_root.expanduser()
+    if not (source_root / "server.py").is_file():
+        raise RuntimeError(f"source root does not contain server.py: {source_root}")
+
+    data_root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["AYLA_HOME"] = str(data_root)
+    env["AYLA_PROJECT_ROOT"] = str(source_root)
+    result = subprocess.run(
+        [sys.executable, "-c", "import server; server.init_db()"],
+        cwd=str(source_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"init_db exited with {result.returncode}").strip()
+        raise RuntimeError(detail)
+
+    db_path = data_root / "system" / "database.sqlite"
+    spaces: list[str] = []
+    memory_count = 0
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            spaces = [
+                row[0]
+                for row in conn.execute("SELECT slug FROM knowledge_spaces ORDER BY sort_order ASC").fetchall()
+            ]
+            memory_count = int(conn.execute("SELECT COUNT(*) FROM agent_memories").fetchone()[0])
+    payload = {
+        "ok": True,
+        "version": VERSION,
+        "mode": mode,
+        "initialized_at": now_iso(),
+        "source_root": str(source_root),
+        "data_root": str(data_root),
+        "database_path": str(db_path),
+        "agent_memory_root": str(data_root / "AgentMemory"),
+        "local_state_root": str(data_root / "LocalWorkState"),
+        "public_vault_root": str(data_root / "PublicKnowledgeVault"),
+        "knowledge_spaces": spaces,
+        "agent_memories": memory_count,
+    }
+    marker = init_metadata_path(data_root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return payload
 
 
 def install(
@@ -192,13 +250,13 @@ def install(
         raise RuntimeError("missing scripts/build_macos_client.sh")
 
     install_root.mkdir(parents=True, exist_ok=True)
-    data_root(install_root).mkdir(parents=True, exist_ok=True)
     (install_root / "runtime").mkdir(parents=True, exist_ok=True)
     (install_root / "logs").mkdir(parents=True, exist_ok=True)
     app_dir.mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     copy_runtime(source_root, runtime_root, force=force)
+    init_payload = initialize_workspace(source_root=runtime_root, data_root=data_root(install_root), mode="install")
     app_path = build_mac_app_bundle(source_root, install_root, app_dir)
     cli_path = write_cli_wrapper(install_root, bin_dir)
 
@@ -211,6 +269,7 @@ def install(
         "install_root": str(install_root),
         "runtime_root": str(runtime_root),
         "data_root": str(data_root(install_root)),
+        "init": init_payload,
         "app_path": str(app_path),
         "cli_path": str(cli_path),
         "state_path": str(state_path(install_root)),
@@ -354,6 +413,18 @@ def cmd_update(args: argparse.Namespace) -> int:
     return print_json(payload)
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    install_root = expand_path(args.install_root, default_install_root())
+    source_root = expand_path(args.source_root, repo_root())
+    default_data_root = data_root(install_root) if not args.development else source_root / "agent-vault"
+    payload = initialize_workspace(
+        source_root=source_root,
+        data_root=expand_path(args.data_root, default_data_root),
+        mode=args.mode or ("development" if args.development else "manual"),
+    )
+    return print_json(payload)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     return print_json(status_payload(expand_path(args.install_root, default_install_root())))
 
@@ -430,6 +501,14 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--app-dir", default="")
     update_parser.add_argument("--bin-dir", default="")
     update_parser.set_defaults(func=cmd_update)
+
+    init_parser = sub.add_parser("init", help="initialize Ayla local data directories and SQLite schema")
+    init_parser.add_argument("--source-root", default="", help="source checkout or installed runtime containing server.py")
+    add_install_root(init_parser)
+    init_parser.add_argument("--data-root", default="", help="data root to initialize; defaults to install data root")
+    init_parser.add_argument("--development", action="store_true", help="initialize ./agent-vault under the source checkout")
+    init_parser.add_argument("--mode", default="", help="metadata label written to system/init.json")
+    init_parser.set_defaults(func=cmd_init)
 
     status_parser = sub.add_parser("status", help="show install and runtime status")
     add_install_root(status_parser)
